@@ -1,0 +1,5 @@
+# Build-only deps (not needed to just run the app). Inno Setup is a separate
+# install: winget install JRSoftware.InnoSetup
+-r requirements.txt
+pillow          # make_icon.py regenerates icon.ico
+pyinstaller     # builds dist\Pointerizer.exe
