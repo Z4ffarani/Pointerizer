@@ -1,6 +1,10 @@
-"""Generate icon.ico — white sleek pointer in a red-ringed dark circle."""
+"""Generate assets/icon.ico — white sleek pointer in a red-ringed dark circle."""
 import math
+from pathlib import Path
 from PIL import Image, ImageDraw
+
+ASSETS = Path(__file__).resolve().parent.parent / "assets"  # repo-root/assets
+ASSETS.mkdir(exist_ok=True)
 
 S = 1024
 img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
@@ -35,6 +39,7 @@ d.polygon(poly, fill=WHITE)
 # soften the corners: wide round-jointed outline over the polygon edges
 d.line(poly + poly[:2], fill=WHITE, width=48, joint="curve")
 
-img.save("icon.ico", sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
-img.resize((256, 256), Image.LANCZOS).save("icon_preview.png")
-print("icon.ico written")
+img.save(ASSETS / "icon.ico",
+         sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
+img.resize((256, 256), Image.LANCZOS).save(ASSETS / "icon_preview.png")
+print("assets/icon.ico written")

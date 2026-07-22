@@ -2,7 +2,7 @@
 build/
 dist/
 Pointerizer.spec
-icon_preview.png
+assets/icon_preview.png
 
 # Runtime data (created next to the app when it runs)
 ui/

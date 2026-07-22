@@ -1,13 +1,17 @@
-# One-command release build: exe + installer land in dist\
+# One-command release build: exe + installer land in dist\ (run from anywhere).
 $ErrorActionPreference = "Stop"
+Set-Location (Split-Path $PSScriptRoot -Parent)  # repo root, so all paths below are relative to it
 
 python pointerizer.py --selfcheck
 if ($LASTEXITCODE) { throw "selfcheck failed" }
 
-python make_icon.py
+python packaging\make_icon.py
 
 pyinstaller --noconfirm --onefile --windowed --name Pointerizer `
-    --icon icon.ico --add-data "icon.ico;." pointerizer.py
+    --icon assets\icon.ico `
+    --add-data "assets\icon.ico;assets" `
+    --add-data "assets\Ubuntu;assets\Ubuntu" `
+    pointerizer.py
 if ($LASTEXITCODE) { throw "pyinstaller failed" }
 
 $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
@@ -16,7 +20,7 @@ $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
         Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $iscc) { throw "Inno Setup not found - winget install JRSoftware.InnoSetup" }
 
-& $iscc pointerizer.iss
+& $iscc packaging\pointerizer.iss
 if ($LASTEXITCODE) { throw "installer build failed" }
 
 Get-Item dist\Pointerizer.exe, dist\PointerizerSetup.exe |

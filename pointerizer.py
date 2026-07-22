@@ -421,15 +421,15 @@ def set_startup(name, enabled):
 # ---------------------------------------------------------------- UI
 
 STYLE = """
-* { font-family: 'Segoe UI', sans-serif; }
+* { font-family: 'Ubuntu', 'Segoe UI', sans-serif; }
 QWidget { background: #212121; color: #ececec; font-size: 13px; }
 QLabel { background: transparent; }
-QLabel#title { font-size: 21px; font-weight: 600; }
+QLabel#title { font-size: 24px; font-weight: 500; }
 QLabel#subtitle, QLabel#status { color: #9b9b9b; font-size: 12px; }
 QListWidget { background: #181818; border: 1px solid #303030; border-radius: 12px;
               padding: 6px; outline: none; }
 QWidget#flowrow { background: transparent; }
-QLabel#section { color: #cfcfcf; font-size: 12px; font-weight: 600;
+QLabel#section { color: #cfcfcf; font-size: 12px; font-weight: 500;
                  text-transform: uppercase; letter-spacing: 1px; }
 QLabel#rowsub { color: #8a8a8a; font-size: 11px; }
 QCheckBox#rowcheck { spacing: 0; }
@@ -451,7 +451,7 @@ QLineEdit { background: #181818; border: 1px solid #3a3a3a; border-radius: 10px;
             padding: 9px 12px; selection-background-color: #4a4a4a; }
 QLineEdit:focus { border-color: #6e6e6e; }
 QPushButton { background: #2f2f2f; color: #ececec; border: 1px solid #3f3f3f;
-              border-radius: 10px; padding: 9px 16px; font-weight: 600; }
+              border-radius: 10px; padding: 9px 16px; font-weight: 500; }
 QPushButton:hover { background: #3a3a3a; }
 QPushButton:disabled { background: #262626; color: #6b6b6b; border-color: #2e2e2e; }
 QPushButton#record { background: #dc2626; border: none; color: #ffffff; }
@@ -479,6 +479,7 @@ QSpinBox::up-button, QSpinBox::down-button { background: transparent; border: no
 QComboBox QAbstractItemView { background: #181818; border: 1px solid #3a3a3a;
                               selection-background-color: #343434; }
 QCheckBox { color: #9b9b9b; spacing: 8px; }
+QCheckBox#startuptoggle { padding: 8px 2px; }
 QCheckBox:disabled { color: #565656; }
 QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #4a4a4a;
                        border-radius: 4px; background: #181818; }
@@ -496,8 +497,11 @@ def run_ui():
     from PySide6 import QtCore, QtGui, QtWidgets
 
     qapp = QtWidgets.QApplication(sys.argv)
+    asset_dir = Path(getattr(sys, "_MEIPASS", BASE_DIR)) / "assets"
+    for ttf in sorted((asset_dir / "Ubuntu").glob("*.ttf")):  # bundled Ubuntu font
+        QtGui.QFontDatabase.addApplicationFont(str(ttf))
     qapp.setStyleSheet(STYLE)
-    icon = Path(getattr(sys, "_MEIPASS", BASE_DIR)) / "icon.ico"
+    icon = asset_dir / "icon.ico"
     if icon.exists():
         qapp.setWindowIcon(QtGui.QIcon(str(icon)))
 
@@ -688,7 +692,7 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
     listw.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
     layout.addWidget(listw, stretch=1)
 
-    startup_cb = QtWidgets.QCheckBox("Run when I sign in to Windows")
+    startup_cb = QtWidgets.QCheckBox("Run when I sign in to Windows", objectName="startuptoggle")
     startup_cb.setEnabled(False)
     layout.addWidget(startup_cb)
 
@@ -866,15 +870,18 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint)
         dlg.setWindowFlag(QtCore.Qt.WindowCloseButtonHint, False)  # force a choice
         v = QtWidgets.QVBoxLayout(dlg)
+        v.setContentsMargins(20, 18, 20, 18)  # match the rename/schedule dialogs
+        v.setSpacing(12)
         new = rec.steps[rec.checkpoint:]
         head = QtWidgets.QLabel(f"{len(new)} action(s) since last checkpoint")
-        head.setStyleSheet("font-size: 15px; font-weight: 600;")
+        head.setStyleSheet("font-size: 15px; font-weight: 500;")
         v.addWidget(head)
         box = QtWidgets.QListWidget()
         for s in new:
             box.addItem(describe(s))
         v.addWidget(box, stretch=1)
         row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
         cont = QtWidgets.QPushButton("Continue (F8)", objectName="accent")
         set_btn_icon(cont, chr(0xE72A), "#0d0d0d")  # forward arrow reads better than the check
         redo = QtWidgets.QPushButton(" Redo (F7)")  # leading space = icon-text breathing room
@@ -895,7 +902,8 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         redo.clicked.connect(do_redo)
         stop.clicked.connect(lambda: dlg.done(3))
         for b in (cont, redo, stop):
-            row.addWidget(b)
+            b.setFixedHeight(40)          # equal-width, equal-height row like the main buttons
+            row.addWidget(b, stretch=1)
         v.addLayout(row)
 
         # F7/F8/F9 are driven ONLY by the recorder's global listener (works whether
@@ -934,7 +942,7 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         v.setContentsMargins(20, 18, 20, 18)
         v.setSpacing(12)
         head = QtWidgets.QLabel("Name this recording")
-        head.setStyleSheet("font-size: 15px; font-weight: 600;")
+        head.setStyleSheet("font-size: 15px; font-weight: 500;")
         v.addWidget(head)
         edit = QtWidgets.QLineEdit(default)
         edit.selectAll()  # Enter keeps the default; typing replaces it
@@ -1121,7 +1129,7 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         v.setContentsMargins(20, 18, 20, 18)
         v.setSpacing(12)
         head = QtWidgets.QLabel("New name")
-        head.setStyleSheet("font-size: 15px; font-weight: 600;")
+        head.setStyleSheet("font-size: 15px; font-weight: 500;")
         v.addWidget(head)
         edit = QtWidgets.QLineEdit(name)
         edit.selectAll()
@@ -1244,7 +1252,7 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         v.setContentsMargins(20, 18, 20, 18)
         v.setSpacing(12)
         head = QtWidgets.QLabel(f"Schedule '{name}'")
-        head.setStyleSheet("font-size: 15px; font-weight: 600;")
+        head.setStyleSheet("font-size: 15px; font-weight: 500;")
         v.addWidget(head)
         form = QtWidgets.QFormLayout()
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)

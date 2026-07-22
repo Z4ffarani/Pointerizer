@@ -15,9 +15,10 @@ UninstallDisplayIcon={app}\Pointerizer.exe
 ; per-user install: no admin prompt, and the app folder stays writable
 ; (recordings live next to the exe)
 PrivilegesRequired=lowest
-OutputDir=dist
+; paths are relative to this .iss (packaging\), so reach up to the repo root with ..\
+OutputDir=..\dist
 OutputBaseFilename=PointerizerSetup
-SetupIconFile=icon.ico
+SetupIconFile=..\assets\icon.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -26,7 +27,7 @@ WizardStyle=modern
 Name: desktopicon; Description: "Create a &desktop shortcut"; Flags: unchecked
 
 [Files]
-Source: "dist\Pointerizer.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\Pointerizer.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Pointerizer"; Filename: "{app}\Pointerizer.exe"
