@@ -2,6 +2,8 @@
 
 Record mouse + keyboard actions on Windows, replay them on demand or on a schedule.
 
+<p align="center"><img src="assets/preview.png" width="440" alt="Pointerizer app window"></p>
+
 ## Install
 
 Download **PointerizerSetup.exe** from the [latest release](https://github.com/Z4ffarani/Pointerizer/releases) and run it. It's a per-user install — no admin prompt, adds a Start Menu entry and an uninstaller. (It's unsigned, so on first run Windows SmartScreen may warn: **More info → Run anyway**.)
