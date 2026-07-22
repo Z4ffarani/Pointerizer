@@ -1,8 +1,8 @@
 ![Pointerizer](assets/banner.png)
 
-Record mouse + keyboard actions on Windows, replay them on demand or on a schedule.
-
 <p align="center"><img src="assets/preview.png" width="440" alt="Pointerizer app window"></p>
+
+Record mouse + keyboard actions on Windows, replay them on demand or on a schedule.
 
 ## Install
 
