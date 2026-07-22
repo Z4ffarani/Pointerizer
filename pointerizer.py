@@ -543,33 +543,9 @@ def run_ui():
         btn.setIconSize(QtCore.QSize(size, round(size + 2 * bias)))
 
     # Qt's built-in combo/spin arrows are black — invisible on our dark fields.
-    # Render light chevrons to PNG once and point the stylesheet at them.
-    # Everything stays next to the exe for portability; APPDATA only if read-only.
-    ui_dir = BASE_DIR / "ui"
-    try:
-        ui_dir.mkdir(exist_ok=True)
-        (ui_dir / "probe.tmp").write_text("x")
-        (ui_dir / "probe.tmp").unlink()
-    except OSError:
-        ui_dir = Path(os.environ.get("APPDATA", str(BASE_DIR))) / "Pointerizer"
-        ui_dir.mkdir(exist_ok=True)
-
-    def glyph_png(fname, glyph, size=12, color="#b0b0b0"):
-        path = ui_dir / fname
-        pm = QtGui.QPixmap(size, size)
-        pm.fill(QtCore.Qt.transparent)
-        p = QtGui.QPainter(pm)
-        f = QtGui.QFont(icon_font)
-        f.setPixelSize(size)
-        p.setFont(f)
-        p.setPen(QtGui.QColor(color))
-        p.drawText(QtCore.QRectF(0, 0, size, size), QtCore.Qt.AlignCenter, glyph)
-        p.end()
-        pm.save(str(path), "PNG")
-        return str(path).replace("\\", "/")
-
-    chev_down = glyph_png("chevron_down.png", chr(0xE70D))
-    chev_up = glyph_png("chevron_up.png", chr(0xE70E))
+    # Point the stylesheet at the light chevron PNGs bundled in assets/.
+    chev_down = str(asset_dir / "chevron_down.png").replace("\\", "/")
+    chev_up = str(asset_dir / "chevron_up.png").replace("\\", "/")
     qapp.setStyleSheet(STYLE + f'''
 QComboBox::down-arrow {{ image: url("{chev_down}"); width: 12px; height: 12px; }}
 QSpinBox::down-arrow {{ image: url("{chev_down}"); width: 10px; height: 10px; }}

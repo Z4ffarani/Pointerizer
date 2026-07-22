@@ -5,7 +5,6 @@ Pointerizer.spec
 assets/icon_preview.png
 
 # Runtime data (created next to the app when it runs)
-ui/
 recordings/
 
 # Python

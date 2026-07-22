@@ -10,6 +10,8 @@ python packaging\make_icon.py
 pyinstaller --noconfirm --onefile --windowed --name Pointerizer `
     --icon assets\icon.ico `
     --add-data "assets\icon.ico;assets" `
+    --add-data "assets\chevron_down.png;assets" `
+    --add-data "assets\chevron_up.png;assets" `
     --add-data "assets\Ubuntu;assets\Ubuntu" `
     pointerizer.py
 if ($LASTEXITCODE) { throw "pyinstaller failed" }
