@@ -10,6 +10,8 @@ Download **PointerizerSetup.exe** from the [latest release](https://github.com/Z
 
 Your recordings are plain JSON in a `recordings\` folder next to the app.
 
+**To update** — download the newer `PointerizerSetup.exe` and run it. It installs over the existing version in place; your recordings and schedules are kept.
+
 ## Use
 
 **Record** — hit **Record (F9)** (or just press **F9**). The cursor centers, the screen gets a red border, and a draggable pill appears. Everything you do is captured: clicks, drags, typed text (accents included), hotkeys (Ctrl+C…), a lone **Windows key**, and scrolling. When you finish, a popup asks for a name — **Enter** accepts the dated default, or type your own.
@@ -38,12 +40,18 @@ Playback replays raw screen coordinates — it needs the same resolution/layout 
 
 ## Develop
 
+Run it from source — no build needed:
+
 ```
-pip install -r requirements.txt   # runtime only
-python pointerizer.py             # run from source
+git clone https://github.com/Z4ffarani/Pointerizer
+cd Pointerizer
+pip install -r requirements.txt   # runtime deps
+python pointerizer.py
 ```
 
-Build the installer (needs `requirements-dev.txt` + [Inno Setup](https://jrsoftware.org/isinfo.php)):
+`python pointerizer.py --selfcheck` runs the built-in sanity checks.
+
+Build the installer yourself (needs `requirements-dev.txt` + [Inno Setup](https://jrsoftware.org/isinfo.php)):
 
 ```
 pip install -r requirements-dev.txt
@@ -51,7 +59,7 @@ winget install JRSoftware.InnoSetup
 .\packaging\build.ps1
 ```
 
-`packaging\build.ps1` runs the self-check, regenerates the icon, and produces `dist\Pointerizer.exe` (PyInstaller) and `dist\PointerizerSetup.exe` (Inno Setup). To ship an update, bump `MyAppVersion` in [packaging/pointerizer.iss](packaging/pointerizer.iss) and rerun it — installing over an older version upgrades in place, and recordings and schedules survive.
+`packaging\build.ps1` runs the self-check, regenerates the icon, and produces `dist\Pointerizer.exe` (PyInstaller) and `dist\PointerizerSetup.exe` (Inno Setup). For a new version, bump `MyAppVersion` in [packaging/pointerizer.iss](packaging/pointerizer.iss) before building — the `AppId` never changes, so the new installer upgrades any older one in place.
 
 ### Layout
 
