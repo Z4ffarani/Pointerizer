@@ -1,7 +1,5 @@
 ![Pointerizer](assets/banner.png)
 
-<p align="center"><img src="assets/preview.png" width="440" alt="Pointerizer app window"></p>
-
 Record mouse + keyboard actions on Windows, replay them on demand or on a schedule.
 
 ## Install
@@ -10,16 +8,24 @@ Download **PointerizerSetup.exe** from the [latest release](https://github.com/Z
 
 Your recordings are plain JSON in a `recordings\` folder next to the app.
 
-**To update** — download the newer `PointerizerSetup.exe` and run it. It installs over the existing version in place; your recordings and schedules are kept.
+**To update** — download the newer `PointerizerSetup.exe` and run it from wherever it landed (your Downloads folder is fine). You don't need to put it in, or point it at, the folder Pointerizer is already installed in: the installer recognises the existing install and upgrades it in place, keeping your recordings and schedules. Close the app first if it's running.
 
 ## Use
 
 **Record** — hit **Record (F9)** (or just press **F9**). The cursor centers, the screen gets a red border, and a draggable pill appears. Everything you do is captured: clicks, drags, typed text (accents included), hotkeys (Ctrl+C…), a lone **Windows key**, and scrolling. When you finish, a popup asks for a name — **Enter** accepts the dated default, or type your own.
 
 - **F8** — checkpoint: pause and review actions since the last one. F8 again continues; **F7** deletes the last action; **F9** stops & saves. (These work globally.)
-- Drag the pill mid-flow to pause at a checkpoint; the drag time isn't recorded.
+- Drag the pill mid-flow to pause at a checkpoint; the drag time isn't recorded. Moving the mouse or typing while you think is free too — the clock only resets, so nothing you do gets lost, it just isn't replayed as dead time.
 
-**Play** — click a recording and hit **Play**, or double-click it. You get 2 seconds to bring your target window to front, then it replays with the original timing (the pointer glides to each target). Playback also starts from a centered cursor. **Abort** anytime with **Esc** or by slamming the mouse into a screen corner.
+**Timing** — the save popup asks how the flow should replay:
+
+- **Keep my original timing** (default) — every pause you took is reproduced exactly.
+- **Unticked** — every step replays a fixed **0.35s** apart. Faster, and it strips out the thinking time. The gap is deliberately not zero: actions fired back-to-back tend to outrun the app you're driving, so 0.35s gives each one time to land. Your original timings stay in the file, so nothing is destroyed by choosing this.
+
+**Play** — click a recording and hit **Play**, or double-click it. You get 2 seconds to bring your target window to front, then it replays (the pointer glides to each target). Playback also starts from a centered cursor. A grey border frames the screen and a pill shows the controls:
+
+- **F7** — pause. The border turns yellow and the pill says so; **F7** again resumes from exactly where it stopped. Time spent paused isn't charged against the next step's delay.
+- **Esc** — cancel outright. Slamming the mouse into a screen corner also aborts.
 
 **Select & delete** — tick a flow's **checkbox** (click again to unselect); **Shift+click** a checkbox to select a range. A red **trash icon** appears top-right — click it (or press **Del**) to delete the selected flows. Each row also has **pencil** (rename) and **clock** (schedule) icons.
 
@@ -28,7 +34,11 @@ Your recordings are plain JSON in a `recordings\` folder next to the app.
 - **Run at sign-in** — tick **"Run when I sign in to Windows"** (drops a launcher in your Startup folder). Only one flow can hold the sign-in slot at a time.
 - **Run at set times** — the **clock icon** creates a Windows Task Scheduler task (hourly/daily/weekly, a start time, and plays-per-run). Reopen the dialog to change or remove it.
 
-Both need you signed in — Windows blocks synthetic input on the lock screen. Recordings are plain JSON, so you can also wire them to Task Scheduler yourself:
+Scheduled runs show the same grey border and control pill as a normal playback, so a flow firing on its own is never a silent takeover of your mouse — **F7** pauses it and **Esc** cancels it, exactly as when you start it by hand.
+
+**The PC has to be on and signed in.** A scheduled run cannot fire while the machine is off, asleep, or hibernating — Task Scheduler has nothing to run it on. It also can't fire at the lock screen, because Windows blocks synthetic input there. A task whose time passed while the PC was off simply doesn't happen; it won't queue up and fire later.
+
+Recordings are plain JSON, so you can also wire them to Task Scheduler yourself:
 
 ```
 "C:\path\to\Pointerizer.exe" --play "C:\path\to\recordings\myjob.json" --repeat 3
@@ -65,7 +75,7 @@ winget install JRSoftware.InnoSetup
 
 ```
 pointerizer.py        the whole app (single file)
-assets/               icon, banner, bundled Ubuntu font
+assets/               icon, banner, chevrons, bundled Ubuntu font
 packaging/            build.ps1, make_icon.py, Inno Setup script
 requirements*.txt     runtime / build deps
 ```

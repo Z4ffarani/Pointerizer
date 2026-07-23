@@ -1,7 +1,8 @@
 ﻿"""Pointerizer — record mouse/keyboard actions, replay them, schedule via Task Scheduler.
 
 Hotkeys while recording:  F8 = checkpoint (review/redo)   F9 = stop & save
-Playback abort: press Esc, or slam the mouse into any screen corner (pyautogui failsafe).
+Hotkeys while playing:    F7 = pause/resume               Esc = cancel
+(the mouse slammed into any screen corner also cancels — pyautogui failsafe)
 """
 import argparse
 import ctypes
@@ -24,6 +25,7 @@ except Exception:
 
 from pynput import mouse, keyboard
 from pynput.keyboard import Key
+from PySide6 import QtCore, QtGui, QtWidgets
 
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).parent
@@ -33,6 +35,11 @@ RECORDINGS_DIR = BASE_DIR / "recordings"
 
 CHECKPOINT_KEY = Key.f8
 STOP_KEY = Key.f9
+CANCEL_KEY = Key.esc  # stops playback outright
+PAUSE_KEY = Key.f7    # holds playback where it is; press again to resume
+
+FIXED_DELAY = 0.35  # gap used by flows saved without their timing — long enough that the
+#                     previous action's UI has settled before the next one fires
 
 MODS = {
     Key.ctrl: "ctrl", Key.ctrl_l: "ctrl", Key.ctrl_r: "ctrl",
@@ -295,8 +302,12 @@ def type_text(text, interval=0.02):
         pyautogui.write(text, interval=interval)  # ASCII-only fallback
 
 
-def play(steps, on_step=None, cancel=None):
-    """Replay steps. Returns False if cancelled via the `cancel` callable, else True."""
+def play(steps, on_step=None, cancel=None, pause=None, fixed_delay=None):
+    """Replay steps. Returns False if cancelled via the `cancel` callable, else True.
+
+    `pause` is polled like `cancel`; while it reads True playback holds where it is.
+    `fixed_delay` replaces every recorded gap — used by flows saved without their timing.
+    """
     import pyautogui
     pyautogui.FAILSAFE = True
 
@@ -308,11 +319,24 @@ def play(steps, on_step=None, cancel=None):
     def cancelled():
         return cancel is not None and cancel()
 
+    def held():
+        """Block while paused. False if the user cancelled instead of resuming."""
+        while pause is not None and pause():
+            if cancelled():
+                return False
+            time.sleep(0.05)
+        return True
+
     def wait(secs):
         end = time.perf_counter() + secs
         while time.perf_counter() < end:
             if cancelled():
                 return False
+            if pause is not None and pause():
+                t0 = time.perf_counter()
+                if not held():
+                    return False
+                end += time.perf_counter() - t0  # time spent paused doesn't eat the gap
             time.sleep(min(0.1, max(0.0, end - time.perf_counter())))
         return True
 
@@ -335,7 +359,9 @@ def play(steps, on_step=None, cancel=None):
     for i, s in enumerate(steps):
         if cancelled():
             return False
-        delay = s.get("delay", 0)
+        if not held():  # pause also takes hold between zero-delay steps
+            return False
+        delay = fixed_delay if fixed_delay is not None else s.get("delay", 0)
         if on_step:
             on_step(i)
         t = s["t"]
@@ -385,12 +411,17 @@ def load_recording(path):
         return json.load(f)
 
 
-def save_recording(name, steps):
+def save_recording(name, steps, fixed_delay=None):
+    """Write a recording. `fixed_delay` set means replay ignores the recorded gaps and
+    uses that constant instead — the original timings stay in the file either way."""
     RECORDINGS_DIR.mkdir(exist_ok=True)
     path = RECORDINGS_DIR / f"{name}.json"
+    data = {"name": name, "created": datetime.now().isoformat(timespec="seconds"),
+            "steps": steps}
+    if fixed_delay is not None:
+        data["fixed_delay"] = fixed_delay
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"name": name, "created": datetime.now().isoformat(timespec="seconds"),
-                   "steps": steps}, f, indent=1)
+        json.dump(data, f, indent=1)
     return path
 
 
@@ -415,7 +446,9 @@ def set_startup(name, enabled):
     else:
         cmd = (f'start "" "{sys.executable}" "{Path(__file__).resolve()}"'
                f' --play "{target}" --wait 300')
-    p.write_text("@echo off\n" + cmd + "\n", encoding="mbcs")
+    # UTF-8 + chcp, not mbcs: names may hold characters the system ANSI codepage can't
+    # encode (any non-Latin script on a western install), and mbcs raises on those.
+    p.write_text("@echo off\nchcp 65001 >nul\n" + cmd + "\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------------- UI
@@ -432,9 +465,11 @@ QWidget#flowrow { background: transparent; }
 QLabel#section { color: #cfcfcf; font-size: 12px; font-weight: 500;
                  text-transform: uppercase; letter-spacing: 1px; }
 QLabel#rowsub { color: #8a8a8a; font-size: 11px; }
-QCheckBox#rowcheck { spacing: 0; }
+/* transparent background: it inherits QWidget's #212121 and, now that it spans the
+   whole row height, would otherwise paint a visible slab behind the tick */
+QCheckBox#rowcheck { spacing: 0; background: transparent; }
 QCheckBox#rowcheck::indicator { width: 17px; height: 17px; border: 1px solid #4a4a4a;
-                                border-radius: 5px; background: #202020; }
+                                border-radius: 5px; background: transparent; }
 QCheckBox#rowcheck::indicator:hover { border-color: #6e6e6e; }
 QCheckBox#rowcheck::indicator:checked { background: #3b82f6; border-color: #3b82f6; }
 QPushButton#trashbtn { background: #dc2626; border: none; border-radius: 7px; padding: 0; }
@@ -490,17 +525,168 @@ QPushButton#pillbtn { border-radius: 15px; padding: 7px 14px; }
 QPushButton#pillfinish { background: #dc2626; color: #ffffff; border: none;
                          border-radius: 15px; padding: 7px 14px; }
 QPushButton#pillfinish:hover { background: #ef3b3b; }
+QLabel#playdot { font-size: 15px; }
+/* playback pill buttons: same colours/geometry as the recording pill's, but with an
+   explicit border. With `border: none` Qt draws the background as a plain rect and the
+   radius never clips — the surrounding QFrame#pill rounds precisely because it has one. */
+QPushButton#playpause { background: #f5c542; color: #0d0d0d;
+                        border: 1px solid #f5c542; border-radius: 15px; padding: 7px 14px; }
+QPushButton#playcancel { background: #dc2626; color: #ffffff;
+                         border: 1px solid #dc2626; border-radius: 15px; padding: 7px 14px; }
 """
 
 
-def run_ui():
-    from PySide6 import QtCore, QtGui, QtWidgets
+OVERLAY_FLAGS = (QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint |
+                 QtCore.Qt.Tool)
 
-    qapp = QtWidgets.QApplication(sys.argv)
-    asset_dir = Path(getattr(sys, "_MEIPASS", BASE_DIR)) / "assets"
-    for ttf in sorted((asset_dir / "Ubuntu").glob("*.ttf")):  # bundled Ubuntu font
+PLAY_BORDER = "#8e8ea0"   # shown while replaying, in the GUI and on scheduled runs alike
+PAUSE_BORDER = "#f5c542"  # and turns yellow while held at a pause (matches #pillbtn)
+
+
+class Border(QtWidgets.QWidget):
+    """Colored frame around a screen; clicks pass straight through it."""
+    def __init__(self, geo, color):
+        super().__init__(None, OVERLAY_FLAGS | QtCore.Qt.WindowTransparentForInput |
+                         QtCore.Qt.WindowDoesNotAcceptFocus)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
+        self.setGeometry(geo)
+        self._color = color
+
+    def set_color(self, color):
+        self._color = color
+        self.update()
+
+    def paintEvent(self, _):
+        p = QtGui.QPainter(self)
+        p.setPen(QtGui.QPen(QtGui.QColor(self._color), 5))
+        p.drawRect(self.rect().adjusted(2, 2, -3, -3))
+
+
+class PlaybackHud:
+    """Screen borders plus a floating pill, so a replay is always visible and its
+    controls discoverable. Used by the GUI and by scheduled runs alike.
+
+    Every method must be called from the Qt thread; playback itself runs off-thread.
+    """
+
+    def __init__(self, qapp):
+        self._borders = [Border(s.geometry(), PLAY_BORDER) for s in qapp.screens()]
+        # click-through: the mouse is being driven during playback, so the pill must
+        # never swallow a synthetic click that was meant for the app underneath
+        self._pill = QtWidgets.QWidget(None, OVERLAY_FLAGS |
+                                       QtCore.Qt.WindowTransparentForInput |
+                                       QtCore.Qt.WindowDoesNotAcceptFocus)
+        self._pill.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self._pill.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
+        outer = QtWidgets.QHBoxLayout(self._pill)
+        outer.setContentsMargins(0, 0, 0, 0)
+        frame = QtWidgets.QFrame(objectName="pill")
+        outer.addWidget(frame)
+        h = QtWidgets.QHBoxLayout(frame)
+        h.setContentsMargins(18, 9, 10, 9)
+        h.setSpacing(10)
+        self._dot = QtWidgets.QLabel("●", objectName="playdot")
+        self._status = QtWidgets.QLabel()
+        # Same colours and geometry as the recording pill's buttons; see the stylesheet
+        # for why these need their own rules rather than reusing #pillbtn/#pillfinish.
+        # Never clicked (the window is click-through), hence no focus and no hover.
+        self._pause_chip = QtWidgets.QPushButton(objectName="playpause")
+        cancel_chip = QtWidgets.QPushButton("Cancel (Esc)", objectName="playcancel")
+        for b in (self._pause_chip, cancel_chip):
+            b.setFocusPolicy(QtCore.Qt.NoFocus)
+            b.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        # size for the longer caption so the pill doesn't jitter when it toggles
+        fm = self._pause_chip.fontMetrics()
+        self._pause_chip.setFixedWidth(
+            max(fm.horizontalAdvance(t) for t in ("Pause (F7)", "Resume (F7)")) + 36)
+        self._status.setFixedWidth(
+            max(fm.horizontalAdvance(t) for t in ("Playing", "Paused")) + 6)
+        h.addWidget(self._dot)
+        h.addWidget(self._status)
+        h.addSpacing(6)
+        h.addWidget(self._pause_chip)
+        h.addWidget(cancel_chip)
+        self._screen = qapp.primaryScreen()
+        self._paused = None  # None = never set, so the first sync() always paints
+
+    def show(self):
+        for b in self._borders:
+            b.show()
+        self.sync(False)
+
+    def sync(self, paused):
+        """Repaint for the current pause state. Cheap to call repeatedly."""
+        if paused == self._paused:
+            return
+        self._paused = paused
+        colour = PAUSE_BORDER if paused else PLAY_BORDER
+        for b in self._borders:
+            b.set_color(colour)
+        self._dot.setStyleSheet(f"color: {colour};")
+        self._status.setText("Paused" if paused else "Playing")
+        self._pause_chip.setText("Resume (F7)" if paused else "Pause (F7)")
+        # the labels change width between states; without re-activating the layout the
+        # already-shown window keeps its old size and clips the longer text
+        self._pill.layout().activate()
+        self._pill.resize(self._pill.sizeHint())
+        geo = self._screen.geometry()
+        self._pill.move(geo.center().x() - self._pill.width() // 2, geo.top() + 24)
+        self._pill.show()
+        self._pill.raise_()
+
+    def close(self):
+        self._pill.close()
+        for b in self._borders:
+            b.close()
+
+
+ASSET_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR)) / "assets"
+
+
+def apply_theme(qapp):
+    """Bundled font + stylesheet. Scheduled runs need it too, or the pill renders
+    in Qt's default grey instead of matching the app."""
+    for ttf in sorted((ASSET_DIR / "Ubuntu").glob("*.ttf")):
         QtGui.QFontDatabase.addApplicationFont(str(ttf))
     qapp.setStyleSheet(STYLE)
+
+
+LLKHF_INJECTED = 0x10  # KBDLLHOOKSTRUCT.flags bit marking a synthetic keystroke
+
+
+def playback_listener(flags):
+    """Global hotkeys during playback: Esc cancels, F7 toggles pause.
+
+    F7 toggles on *release* — Windows repeats on_press while a key is held down, which
+    would otherwise flip pause on and off many times a second.
+    """
+    def not_injected(msg, data):
+        # The keys we replay come back through this same global hook. Without this
+        # filter, replaying a recorded Esc would cancel the playback that just sent it,
+        # and a recorded F7 would pause it — flows that close a dialog would abort
+        # themselves. Returning False only skips our callbacks; the keystroke still
+        # reaches the app being driven.
+        # ponytail: also ignores on-screen keyboards and remote-desktop input, which
+        # arrive injected too — rare enough to accept, revisit if someone hits it.
+        return not (data.flags & LLKHF_INJECTED)
+
+    def on_press(k):
+        if k == CANCEL_KEY:
+            flags["cancel"] = True
+
+    def on_release(k):
+        if k == PAUSE_KEY:
+            flags["paused"] = not flags["paused"]
+
+    return keyboard.Listener(on_press=on_press, on_release=on_release,
+                             win32_event_filter=not_injected)
+
+
+def run_ui():
+    qapp = QtWidgets.QApplication(sys.argv)
+    asset_dir = ASSET_DIR
+    apply_theme(qapp)
     icon = asset_dir / "icon.ico"
     if icon.exists():
         qapp.setWindowIcon(QtGui.QIcon(str(icon)))
@@ -556,27 +742,6 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         chr(0xE73E), chr(0xE72C), chr(0xE71A), chr(0xE823), chr(0xE7C1))
     GLYPH_PLAY, GLYPH_RECORD, GLYPH_TRASH = chr(0xE768), chr(0xE7C8), chr(0xE74D)
     GLYPH_PENCIL = chr(0xE70F)
-
-    OVERLAY_FLAGS = (QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint |
-                     QtCore.Qt.Tool)
-
-    class Border(QtWidgets.QWidget):
-        """Colored frame around a screen; clicks pass straight through it."""
-        def __init__(self, geo, color):
-            super().__init__(None, OVERLAY_FLAGS | QtCore.Qt.WindowTransparentForInput)
-            self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
-            self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
-            self.setGeometry(geo)
-            self._color = color
-
-        def set_color(self, color):
-            self._color = color
-            self.update()
-
-        def paintEvent(self, _):
-            p = QtGui.QPainter(self)
-            p.setPen(QtGui.QPen(QtGui.QColor(self._color), 5))
-            p.drawRect(self.rect().adjusted(2, 2, -3, -3))
 
     class Pill(QtWidgets.QWidget):
         """Floating, draggable recording control."""
@@ -685,7 +850,8 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
     status = QtWidgets.QLabel("", objectName="status", alignment=QtCore.Qt.AlignCenter)
     layout.addWidget(status)
 
-    state = {"recorder": None, "name": "", "play_result": None, "pill_rect": None}
+    state = {"recorder": None, "name": "", "play_result": None, "pill_rect": None,
+             "hud": None, "play_flags": None}
     overlays = []
 
     def show_overlays(color):
@@ -774,10 +940,13 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         cb.setFocusPolicy(QtCore.Qt.NoFocus)
         cb.clicked.connect(lambda _checked, n=name: cb_clicked(n))  # tick = select for delete
         row_checks[name] = cb
-        h.addWidget(cb, 0, QtCore.Qt.AlignVCenter)
+        # span the full name+schedule block instead of floating beside it; the 17px
+        # indicator still centres itself, so the tick lines up with the two-line text
+        cb.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.MinimumExpanding)
+        h.addWidget(cb)
 
         texts = QtWidgets.QVBoxLayout()
-        texts.setSpacing(1)
+        texts.setSpacing(4)  # breathing room between the flow name and its schedule line
         texts.addStretch(1)  # vertically center the text block in the row
         name_lbl = QtWidgets.QLabel(name)
         # clicks on the text fall through to the row so a row-click highlights it (Play target)
@@ -923,6 +1092,14 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         edit = QtWidgets.QLineEdit(default)
         edit.selectAll()  # Enter keeps the default; typing replaces it
         v.addWidget(edit)
+        keep = QtWidgets.QCheckBox("Keep my original timing")
+        keep.setChecked(True)
+        v.addWidget(keep)
+        hint = QtWidgets.QLabel(f"Unticked, every step replays {FIXED_DELAY:g}s apart — "
+                                "faster, and it drops the pauses you took while recording.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #9a9a9a; font-size: 12px;")
+        v.addWidget(hint)
         row = QtWidgets.QHBoxLayout()
         okb = QtWidgets.QPushButton("Save", objectName="primary")
         cancelb = QtWidgets.QPushButton("Discard")
@@ -935,7 +1112,8 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         edit.setFocus()
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return None
-        return re.sub(r"[^\w\- ]", "", edit.text().strip()) or default
+        name = re.sub(r"[^\w\- ]", "", edit.text().strip()) or default
+        return name, (None if keep.isChecked() else FIXED_DELAY)
 
     def unique_name(name):
         if not (RECORDINGS_DIR / f"{name}.json").exists():
@@ -979,11 +1157,13 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         set_busy(False)
         if rec.steps:
             default = datetime.now().strftime("Recording %Y-%m-%d %H-%M-%S")
-            name = prompt_name(default)
-            if name:
+            chosen = prompt_name(default)
+            if chosen:
+                name, fixed = chosen
                 name = unique_name(name)
-                save_recording(name, rec.steps)
-                status.setText(f"Saved '{name}' ({len(rec.steps)} steps)")
+                save_recording(name, rec.steps, fixed)
+                timing = "original timing" if fixed is None else f"{fixed:g}s steps"
+                status.setText(f"Saved '{name}' ({len(rec.steps)} steps, {timing})")
             else:
                 status.setText("Recording discarded.")
         else:
@@ -1026,16 +1206,18 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         data = load_recording(path)
         set_busy(True)
         win.hide()
-        show_overlays("#8e8ea0")
+        state["hud"] = PlaybackHud(qapp)
+        state["hud"].show()
+        flags = state["play_flags"] = {"cancel": False, "paused": False}
 
         def worker():
-            esc = {"v": False}
-            lst = keyboard.Listener(
-                on_press=lambda k: esc.__setitem__("v", True) if k == Key.esc else None)
+            lst = playback_listener(flags)
             lst.start()
             time.sleep(2)  # give the user's target window time to be in front
             try:
-                if play(data["steps"], cancel=lambda: esc["v"]):
+                if play(data["steps"], cancel=lambda: flags["cancel"],
+                        pause=lambda: flags["paused"],
+                        fixed_delay=data.get("fixed_delay")):
                     state["play_result"] = f"Played '{data['name']}' ({len(data['steps'])} steps)"
                 else:
                     state["play_result"] = "Playback cancelled (Esc)"
@@ -1049,10 +1231,15 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         play_poll.start()
 
     def on_play_poll():
+        hud, flags = state.get("hud"), state.get("play_flags")
+        if hud and flags:
+            hud.sync(flags["paused"])  # yellow border + pill, repainted on the Qt thread
         if state["play_result"] is None:
             return
         play_poll.stop()
-        hide_overlays()
+        if hud:
+            hud.close()
+            state["hud"] = None
         win.show()
         win.raise_()
         win.activateWindow()
@@ -1098,20 +1285,34 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
             delete_flow(selected_name())
 
     def rename_flow(name):
+        src = RECORDINGS_DIR / f"{name}.json"
+        try:
+            data = load_recording(src)
+        except Exception:
+            status.setText(f"Can't read '{name}'.")
+            return
         dlg = QtWidgets.QDialog(win)
-        dlg.setWindowTitle("Rename")
+        dlg.setWindowTitle("Edit recording")
         dlg.setFixedWidth(420)
         v = QtWidgets.QVBoxLayout(dlg)
         v.setContentsMargins(20, 18, 20, 18)
         v.setSpacing(12)
-        head = QtWidgets.QLabel("New name")
+        head = QtWidgets.QLabel("Name")
         head.setStyleSheet("font-size: 15px; font-weight: 500;")
         v.addWidget(head)
         edit = QtWidgets.QLineEdit(name)
         edit.selectAll()
         v.addWidget(edit)
+        keep = QtWidgets.QCheckBox("Keep my original timing")
+        keep.setChecked("fixed_delay" not in data)  # reflects how it's saved today
+        v.addWidget(keep)
+        hint = QtWidgets.QLabel(f"Unticked, every step replays {FIXED_DELAY:g}s apart — "
+                                "faster, and it drops the pauses you took while recording.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #9a9a9a; font-size: 12px;")
+        v.addWidget(hint)
         row = QtWidgets.QHBoxLayout()
-        okb = QtWidgets.QPushButton("Rename", objectName="primary")
+        okb = QtWidgets.QPushButton("Save", objectName="primary")
         cancelb = QtWidgets.QPushButton("Cancel")
         okb.clicked.connect(dlg.accept)
         cancelb.clicked.connect(dlg.reject)
@@ -1122,19 +1323,30 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         edit.setFocus()
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
+        # timing is editable on its own — applied whether or not the name changed
+        if keep.isChecked():
+            data.pop("fixed_delay", None)
+        else:
+            data["fixed_delay"] = FIXED_DELAY
+        timing = "original timing" if keep.isChecked() else f"{FIXED_DELAY:g}s steps"
+
         new = re.sub(r"[^\w\- ]", "", edit.text().strip())
-        if not new or new == name:
+        if not new or new == name:  # timing-only edit: rewrite in place, keep schedules
+            with open(src, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=1)
+            status.setText(f"Updated '{name}' ({timing})")
+            refresh()
+            select_by_name(name)
             return
         new_p = RECORDINGS_DIR / f"{new}.json"
         if new_p.exists():
             status.setText(f"'{new}' already exists.")
             return
-        data = load_recording(RECORDINGS_DIR / f"{name}.json")
-        data["name"] = new
+        data["name"] = new  # already carries the timing choice made above
         data.pop("schedule", None)  # its Task Scheduler task is dropped below
         with open(new_p, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=1)
-        (RECORDINGS_DIR / f"{name}.json").unlink()
+        src.unlink()
         if startup_path(name).exists():  # migrate the sign-in launcher
             set_startup(name, False)
             set_startup(new, True)
@@ -1142,9 +1354,10 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         r = subprocess.run(["schtasks", "/Delete", "/F", "/TN", f"Pointerizer - {name}"],
                            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
         if r.returncode == 0:
-            status.setText(f"Renamed to '{new}' — its schedule was removed, re-create it.")
+            status.setText(f"Renamed to '{new}' ({timing}) — its schedule was removed, "
+                           "re-create it.")
         else:
-            status.setText(f"Renamed to '{new}'")
+            status.setText(f"Renamed to '{new}' ({timing})")
         refresh()
         select_by_name(new)
 
@@ -1398,6 +1611,13 @@ def selfcheck():
     path = save_recording("_selfcheck", steps)
     loaded = load_recording(path)
     assert loaded["steps"] == steps
+    assert "fixed_delay" not in loaded  # keeping original timing writes no override
+    fixed = load_recording(save_recording("_selfcheck", steps, FIXED_DELAY))
+    assert fixed["fixed_delay"] == FIXED_DELAY
+    assert fixed["steps"] == steps      # the recorded gaps survive the override
+    # the edit dialog toggles that key both ways; re-ticking must leave no residue
+    fixed.pop("fixed_delay", None)
+    assert "fixed_delay" not in fixed and fixed["steps"] == steps
     for s in steps:
         assert describe(s)
     import pyautogui
@@ -1439,13 +1659,42 @@ def main():
         if not path.exists():
             path = RECORDINGS_DIR / f"{args.play}.json"
         data = load_recording(path)
-        esc = {"v": False}
-        keyboard.Listener(
-            on_press=lambda k: esc.__setitem__("v", True) if k == Key.esc else None).start()
-        time.sleep(max(0, args.wait))  # grace period (desktop settle time)
-        for _ in range(max(1, args.repeat)):
-            if not play(data["steps"], cancel=lambda: esc["v"]):
-                break
+        flags = {"cancel": False, "paused": False}
+        playback_listener(flags).start()
+
+        # Same border and pill the GUI shows while replaying, so a scheduled run is
+        # never a silent takeover of the mouse and its controls stay discoverable.
+        # Playback runs off-thread; Qt owns the main thread so the overlays paint.
+        qapp = QtWidgets.QApplication(sys.argv)
+        apply_theme(qapp)
+        hud = PlaybackHud(qapp)
+        hud.show()
+        QtCore.QTimer(qapp, interval=200,
+                      timeout=lambda: hud.sync(flags["paused"])).start()
+
+        failed = []  # non-empty => exit non-zero so Task Scheduler records the failure
+
+        def worker():
+            # try/finally is load-bearing: the corner-slam failsafe raises out of
+            # play(), and without the quit the process would sit there forever with
+            # the border stuck on screen — as a scheduled task, invisibly, every run.
+            try:
+                time.sleep(max(0, args.wait))  # grace period (desktop settle time)
+                for _ in range(max(1, args.repeat)):
+                    if not play(data["steps"], cancel=lambda: flags["cancel"],
+                                pause=lambda: flags["paused"],
+                                fixed_delay=data.get("fixed_delay")):
+                        break
+            except Exception as e:
+                print(f"playback aborted: {e}", file=sys.stderr)
+                failed.append(e)
+            finally:
+                QtCore.QMetaObject.invokeMethod(qapp, "quit", QtCore.Qt.QueuedConnection)
+
+        threading.Thread(target=worker, daemon=True).start()
+        qapp.exec()
+        if failed:
+            sys.exit(1)
     else:
         run_ui()
 
