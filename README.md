@@ -25,6 +25,8 @@ Your recordings are plain JSON in a `recordings\` folder next to the app.
 - **F7** — pause. The border turns yellow and the pill says so; **F7** again resumes from exactly where it stopped. Time spent paused isn't charged against the next step's delay.
 - **Esc** — cancel outright. Slamming the mouse into a screen corner also aborts.
 
+**Reorder** — drag a flow up or down to arrange the list however you like; the order is remembered.
+
 **Select & delete** — tick a flow's **checkbox** (click again to unselect); **Shift+click** a checkbox to select a range. Ticking a box also makes that flow the active one, so the sign-in toggle applies to it. A red **trash icon** appears top-right — click it (or press **Del**) to delete the selected flows. Each row also has **pencil** (edit) and **clock** (schedule) icons.
 
 **Edit** — the **pencil** opens a recording to rename it, switch its timing, and **delete individual steps** (select a step and hit Delete). Changes apply only when you **Save**; **Esc** closes without touching the recording.

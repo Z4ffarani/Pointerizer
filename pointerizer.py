@@ -671,6 +671,33 @@ def recording_error(data):
     return None
 
 
+# the user's preferred flow order, as a list of names. Kept out of RECORDINGS_DIR so it
+# isn't picked up as a recording by the *.json glob.
+ORDER_PATH = BASE_DIR / "flow-order.json"
+
+
+def load_order():
+    try:
+        order = json.loads(ORDER_PATH.read_text(encoding="utf-8"))
+        return [n for n in order if isinstance(n, str)] if isinstance(order, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def save_order(names):
+    try:
+        ORDER_PATH.write_text(json.dumps(names), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def ordered_names(names, order):
+    """`names` arranged by the saved `order`; anything not in it (new or never-moved
+    recordings) falls to the end, alphabetically."""
+    rank = {n: i for i, n in enumerate(order)}
+    return sorted(names, key=lambda n: (rank.get(n, len(order)), n.lower()))
+
+
 LOG_PATH = BASE_DIR / "pointerizer-activity.log"
 
 
@@ -878,6 +905,27 @@ def fit(widget, *texts):
     return max(fm.horizontalAdvance(t) for t in texts)
 
 
+class FlowList(QtWidgets.QListWidget):
+    """QListWidget that announces a drag-reorder. QListWidget's internal move is an
+    insert+remove rather than a clean rowsMoved, and rowsRemoved also fires on clear(),
+    so a dedicated post-drop signal is the only safe hook."""
+    reordered = QtCore.Signal()
+
+    def startDrag(self, supported_actions):
+        # No drag pixmap: the default is a grey ghost of the row floating under the
+        # cursor. Skip it and let the drop-position indicator alone show the move.
+        indexes = [i for i in self.selectedIndexes() if i.isValid()]
+        if not indexes:
+            return
+        drag = QtGui.QDrag(self)
+        drag.setMimeData(self.model().mimeData(indexes))
+        drag.exec(supported_actions, self.defaultDropAction())
+
+    def dropEvent(self, event):
+        super().dropEvent(event)
+        self.reordered.emit()
+
+
 class PlaybackHud:
     """Screen borders plus a floating pill, so a replay is always visible and its
     controls discoverable. Used by the GUI and by scheduled runs alike.
@@ -885,15 +933,17 @@ class PlaybackHud:
     Every method must be called from the Qt thread; playback itself runs off-thread.
     """
 
-    def __init__(self, qapp):
+    def __init__(self, qapp, on_cancel=None):
         self._borders = [Border(s.geometry(), PLAY_BORDER) for s in qapp.screens()]
-        # click-through: the mouse is being driven during playback, so the pill must
-        # never swallow a synthetic click that was meant for the app underneath
+        # Not WindowTransparentForInput at the Qt level: click-through is toggled per
+        # phase via WS_EX_TRANSPARENT below. During the countdown the mouse is free, so
+        # the pill is interactive and Cancel is clickable; once playback starts the mouse
+        # is being driven, so the pill goes click-through and can't swallow a driven click.
         self._pill = QtWidgets.QWidget(None, OVERLAY_FLAGS |
-                                       QtCore.Qt.WindowTransparentForInput |
                                        QtCore.Qt.WindowDoesNotAcceptFocus)
         self._pill.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         self._pill.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
+        self._clickthrough = None
         outer = QtWidgets.QHBoxLayout(self._pill)
         outer.setContentsMargins(0, 0, 0, 0)
         frame = QtWidgets.QFrame(objectName="pill")
@@ -904,12 +954,14 @@ class PlaybackHud:
         self._dot = QtWidgets.QLabel("●", objectName="playdot")
         self._status = QtWidgets.QLabel()
         # The recording pill's own button styles, so the two pills cannot drift apart.
-        # Never clicked (the window is click-through), hence no focus and no hover.
         self._pause_chip = QtWidgets.QPushButton(objectName="pillbtn")
+        self._pause_chip.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)  # F7 only
         cancel_chip = QtWidgets.QPushButton("Cancel (Esc)", objectName="pillfinish")
+        cancel_chip.setCursor(QtCore.Qt.PointingHandCursor)  # clickable during countdown
+        if on_cancel:
+            cancel_chip.clicked.connect(on_cancel)
         for b in (self._pause_chip, cancel_chip):
             b.setFocusPolicy(QtCore.Qt.NoFocus)
-            b.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
         h.addWidget(self._dot)
         h.addWidget(self._status)
         h.addSpacing(6)
@@ -938,6 +990,19 @@ class PlaybackHud:
         else:
             self.sync(False)
 
+    def _set_clickthrough(self, on):
+        """Toggle WS_EX_TRANSPARENT so mouse events pass through (playback) or land on
+        the pill (countdown). Done in place, without re-showing the window."""
+        if on == self._clickthrough:
+            return
+        self._clickthrough = on
+        hwnd = int(self._pill.winId())
+        GWL_EXSTYLE, WS_EX_TRANSPARENT = -20, 0x20
+        u = ctypes.windll.user32
+        ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        u.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                         ex | WS_EX_TRANSPARENT if on else ex & ~WS_EX_TRANSPARENT)
+
     def _place(self):
         # captions change width between states; without re-activating the layout the
         # already-shown window keeps its old size and clips the longer text
@@ -956,8 +1021,9 @@ class PlaybackHud:
             for b in self._borders:
                 b.set_color(PLAY_BORDER)
             self._dot.setStyleSheet(f"color: {PLAY_BORDER};")
-            self._pause_chip.hide()  # nothing to pause yet; Esc still cancels
+            self._pause_chip.hide()  # nothing to pause yet; Cancel/Esc still work
             self._status.setFixedWidth(self._w_waiting)
+            self._set_clickthrough(False)  # Cancel is clickable while we wait
         self._status.setText(f"Starting in {secs // 60}:{secs % 60:02d}")
         self._place()
 
@@ -974,6 +1040,7 @@ class PlaybackHud:
         self._status.setText("Paused" if paused else "Playing")
         self._pause_chip.setText("Resume (F7)" if paused else "Pause (F7)")
         self._pause_chip.show()
+        self._set_clickthrough(True)  # mouse is driven now — don't intercept clicks
         self._place()
 
     def close(self):
@@ -1174,11 +1241,15 @@ QSpinBox::up-arrow, QTimeEdit::up-arrow {{ image: url("{chev_up}"); width: 10px;
     header.addWidget(del_icon)
     layout.addLayout(header)
 
-    listw = QtWidgets.QListWidget()
+    listw = FlowList()
     listw.setSpacing(5)  # gap between flow rows
     # SingleSelection: a row-click highlights one flow (the Play/rename/schedule target),
     # no drag multi-select. Ticking flows for deletion is done via their checkbox (cb_clicked).
     listw.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+    # drag a row to reorder; the new order is remembered
+    listw.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
+    listw.setDefaultDropAction(QtCore.Qt.MoveAction)
+    listw.setDropIndicatorShown(True)
     layout.addWidget(listw, stretch=1)
 
     startup_cb = QtWidgets.QCheckBox("Run when I sign in to Windows", objectName="startuptoggle")
@@ -1334,7 +1405,7 @@ QSpinBox::up-arrow, QTimeEdit::up-arrow {{ image: url("{chev_up}"); width: 10px;
         listw.clear()
         row_checks.clear()
         RECORDINGS_DIR.mkdir(exist_ok=True)
-        names = [p.stem for p in sorted(RECORDINGS_DIR.glob("*.json"))]
+        names = ordered_names([p.stem for p in RECORDINGS_DIR.glob("*.json")], load_order())
         checked.intersection_update(names)  # drop stale checks
         for name in names:
             item = QtWidgets.QListWidgetItem()
@@ -1566,9 +1637,9 @@ QSpinBox::up-arrow, QTimeEdit::up-arrow {{ image: url("{chev_up}"); width: 10px;
             return
         set_busy(True)
         win.hide()
-        state["hud"] = PlaybackHud(qapp)
-        state["hud"].show(counting_down=True)
         flags = state["play_flags"] = {"cancel": False, "paused": False}
+        state["hud"] = PlaybackHud(qapp, on_cancel=lambda: flags.__setitem__("cancel", True))
+        state["hud"].show(counting_down=True)
         pre = state["pre_roll"] = {"left": 2, "running": False}
 
         def worker():
@@ -1752,6 +1823,12 @@ QSpinBox::up-arrow, QTimeEdit::up-arrow {{ image: url("{chev_up}"); width: 10px;
         with open(new_p, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=1)
         src.unlink()
+        # keep the renamed flow exactly where it sits — materialise the current order
+        # with the new name swapped in, so it doesn't drop to the bottom
+        current = [listw.item(i).data(QtCore.Qt.UserRole) for i in range(listw.count())]
+        if name in current:
+            current[current.index(name)] = new
+            save_order(current)
         if startup_path(name).exists():  # migrate the sign-in launcher
             set_startup(name, False)
             set_startup(new, True)
@@ -1966,6 +2043,15 @@ QSpinBox::up-arrow, QTimeEdit::up-arrow {{ image: url("{chev_up}"); width: 10px;
     listw.itemDoubleClicked.connect(lambda _it: start_playback())
     startup_cb.toggled.connect(toggle_startup)
 
+    def on_reordered():
+        # fired only by an actual drop (not by refresh's clear()); the moved item keeps
+        # its UserRole name but loses its row widget, so persist and rebuild the rows
+        order = [listw.item(i).data(QtCore.Qt.UserRole) for i in range(listw.count())]
+        save_order([n for n in order if n])
+        QtCore.QTimer.singleShot(0, refresh)
+
+    listw.reordered.connect(on_reordered)
+
     del_sc = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Delete), listw,
                              activated=delete_selected)
     del_sc.setContext(QtCore.Qt.WidgetShortcut)  # only while the list has focus
@@ -2042,6 +2128,10 @@ def selfcheck():
     assert recording_error({"steps": [{"t": "click", "x": 1}]}) # click missing y/button
     assert recording_error({"steps": [{"t": "wat"}]})           # unknown type
     assert recording_error("not a dict")
+    # custom flow order: saved order wins, unknown names trail alphabetically
+    assert ordered_names(["b", "a", "c"], ["c", "a"]) == ["c", "a", "b"]
+    assert ordered_names(["Zed", "amy"], []) == ["amy", "Zed"]  # case-insensitive default
+    assert ordered_names(["a"], ["ghost", "a"]) == ["a"]        # stale names ignored
     assert "fixed_delay" not in loaded  # keeping original timing writes no override
     fixed = load_recording(save_recording("_selfcheck", steps, FIXED_DELAY))
     assert fixed["fixed_delay"] == FIXED_DELAY
@@ -2179,7 +2269,7 @@ def main():
         # Playback runs off-thread; Qt owns the main thread so the overlays paint.
         qapp = QtWidgets.QApplication(sys.argv)
         apply_theme(qapp)
-        hud = PlaybackHud(qapp)
+        hud = PlaybackHud(qapp, on_cancel=lambda: flags.__setitem__("cancel", True))
         wait = SIGNIN_WAIT if args.signin else args.wait
         hud.show(counting_down=wait > 0)
         pre = {"left": max(0, wait), "running": False}

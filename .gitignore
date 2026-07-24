@@ -6,6 +6,8 @@ assets/icon_preview.png
 
 # Runtime data (created next to the app when it runs)
 recordings/
+flow-order.json
+pointerizer-activity.log
 
 # Python
 __pycache__/
