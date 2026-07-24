@@ -5,6 +5,7 @@ Hotkeys while playing:    F7 = pause/resume               Esc = cancel
 (the mouse slammed into any screen corner also cancels — pyautogui failsafe)
 """
 import argparse
+import contextlib
 import ctypes
 import json
 import os
@@ -24,7 +25,7 @@ except Exception:
     pass
 
 from pynput import mouse, keyboard
-from pynput.keyboard import Key
+from pynput.keyboard import Key, KeyCode
 from PySide6 import QtCore, QtGui, QtWidgets
 
 if getattr(sys, "frozen", False):
@@ -40,6 +41,97 @@ PAUSE_KEY = Key.f7    # holds playback where it is; press again to resume
 
 FIXED_DELAY = 0.35  # gap used by flows saved without their timing — long enough that the
 #                     previous action's UI has settled before the next one fires
+
+# Grace period for a sign-in run, so the desktop finishes loading first. The sign-in
+# launcher passes --signin rather than a number, so this value belongs to whichever
+# build is installed: change it in a release and existing users pick it up, instead of
+# being stuck with whatever was baked into their .cmd the day they ticked the box.
+SIGNIN_WAIT = 60
+
+MAPVK_VK_TO_CHAR = 2
+DEAD_KEY_BIT = 0x80000000  # MapVirtualKey sets this for a dead key
+
+
+def foreground_layout():
+    """The keyboard layout of the window being typed into, not of our own thread.
+
+    They differ as soon as someone has two layouts installed and switches: our listener
+    runs on a background thread that keeps whatever layout it started with, so asking it
+    about dead keys would consult the wrong keyboard.
+    """
+    u = ctypes.windll.user32
+    tid = u.GetWindowThreadProcessId(u.GetForegroundWindow(), None)
+    return u.GetKeyboardLayout(tid)
+
+
+def dead_diacritic(key, ch):
+    """`ch` if this key is a dead key that has a combining form, else None.
+
+    MapVirtualKey is a read-only lookup — deliberately not ToUnicodeEx, which would
+    consume the layout's pending dead-key state and corrupt what the user is typing.
+    """
+    vk = getattr(key, "vk", None)
+    if not vk or not ch:
+        return None
+    fn = ctypes.windll.user32.MapVirtualKeyExW
+    fn.restype = ctypes.c_uint
+    if not fn(vk, MAPVK_VK_TO_CHAR, foreground_layout()) & DEAD_KEY_BIT:
+        return None
+    try:
+        KeyCode.from_dead(ch)  # raises unless a COMBINING form exists for it
+    except (KeyError, ValueError):
+        return None
+    return ch
+
+
+NUMPAD_DIGITS = {0x60 + n: str(n) for n in range(10)}  # VK_NUMPAD0..9
+
+
+# CP437 graphics for bytes 0x01–0x1F and 0x7F. Windows' Alt+N (no leading zero) types
+# these for N in 1–31 (Alt+1 → ☺, Alt+26 → →) rather than the C0 control the codepage
+# maps them to; they're identical across every OEM codepage, so this one table suffices.
+OEM_CONTROL_GRAPHICS = {
+    1: "☺", 2: "☻", 3: "♥", 4: "♦", 5: "♣", 6: "♠", 7: "•", 8: "◘", 9: "○",
+    10: "◙", 11: "♂", 12: "♀", 13: "♪", 14: "♫", 15: "☼", 16: "►", 17: "◄",
+    18: "↕", 19: "‼", 20: "¶", 21: "§", 22: "▬", 23: "↨", 24: "↑", 25: "↓",
+    26: "→", 27: "←", 28: "∟", 29: "↔", 30: "▲", 31: "▼", 127: "⌂",
+}
+
+
+def alt_numpad_char(digits):
+    """The character Windows composes from Alt + numpad digits, or None.
+
+    Two legacy forms, and the leading zero is what picks between them: "Alt+0152" reads
+    the code in the ANSI codepage (cp1252 here) and gives "˜"; "Alt+152" reads it in the
+    OEM one (cp850) and gives "ÿ". Values above 255 wrap, as they do in Windows.
+    """
+    if not digits:
+        return None
+    n = int(digits) & 0xFF
+    # OEM form only: low bytes are box/arrow graphics, not the codepage's control chars
+    if not digits.startswith("0") and n in OEM_CONTROL_GRAPHICS:
+        return OEM_CONTROL_GRAPHICS[n]
+    cp = ctypes.windll.kernel32.GetACP() if digits.startswith("0") \
+        else ctypes.windll.kernel32.GetOEMCP()
+    try:
+        return bytes([n]).decode(f"cp{cp}")
+    except (ValueError, LookupError, UnicodeDecodeError):
+        return None
+
+
+def compose_dead(dead, ch):
+    """Combine a pending dead key with the next character, as the layout would.
+
+    join() returns the letter plus a loose combining mark when no precomposed character
+    exists ("q" + U+0302); Windows types the caret and the letter instead, so only a
+    genuine single character counts as a composition.
+    """
+    try:
+        joined = KeyCode.from_dead(dead).join(KeyCode.from_char(ch)).char
+    except ValueError:
+        joined = None
+    return joined if joined and len(joined) == 1 else dead + ch
+
 
 MODS = {
     Key.ctrl: "ctrl", Key.ctrl_l: "ctrl", Key.ctrl_r: "ctrl",
@@ -58,7 +150,17 @@ SPECIAL = {
     Key.up: "up", Key.down: "down", Key.left: "left", Key.right: "right",
     Key.f1: "f1", Key.f2: "f2", Key.f3: "f3", Key.f4: "f4", Key.f5: "f5",
     Key.f6: "f6", Key.f7: "f7", Key.f10: "f10", Key.f11: "f11", Key.f12: "f12",
+    # system and lock keys
+    Key.print_screen: "printscreen", Key.menu: "apps", Key.pause: "pause",
+    Key.num_lock: "numlock", Key.scroll_lock: "scrolllock",
+    # media keys
+    Key.media_volume_up: "volumeup", Key.media_volume_down: "volumedown",
+    Key.media_volume_mute: "volumemute", Key.media_play_pause: "playpause",
+    Key.media_next: "nexttrack", Key.media_previous: "prevtrack", Key.media_stop: "stop",
 }
+# F13–F24 (macro keyboards); added only if this pynput build exposes them
+SPECIAL.update({k: f"f{n}" for n in range(13, 25)
+                if (k := getattr(Key, f"f{n}", None)) is not None})
 
 
 # ---------------------------------------------------------------- recorder
@@ -75,6 +177,8 @@ class Recorder:
         self._last = time.monotonic()
         self._text = ""
         self._text_delay = 0.0
+        self._dead = None            # pending dead key ("^" awaiting its vowel)
+        self._alt_code = ""          # digits typed so far in an Alt+numpad sequence
         self._press = None           # pending mouse-down: (x, y, button, t0, delay)
         self._mods = set()
         self._shift = False
@@ -107,6 +211,11 @@ class Recorder:
             return True
         return False
 
+    def _active_mods(self):
+        """ctrl/alt/win/shift currently held — the modifiers that belong on a click or
+        scroll (Ctrl+click, Shift+click, Ctrl+scroll to zoom)."""
+        return sorted(self._mods) + (["shift"] if self._shift else [])
+
     def _delay(self):
         now = time.monotonic()
         d = round(now - self._last, 3)
@@ -114,9 +223,29 @@ class Recorder:
         return d
 
     def _flush(self):
+        if self._dead:  # "^" then Enter/click: Windows emits the caret on its own
+            if not self._text:
+                self._text_delay = self._delay()
+            self._text += self._dead
+            self._dead = None
         if self._text:
             self.steps.append({"t": "text", "text": self._text, "delay": self._text_delay})
             self._text = ""
+
+    def _compose(self, key, ch):
+        """Fold a dead-key sequence into the character it produces: "^" then "e" -> "ê".
+
+        Windows composes these inside the keyboard layout, only after the second key.
+        A low-level hook sees the two raw presses, and pynput resolves dead keys on X11
+        but not on Windows — so without this, typing "você" records as "voc^e".
+
+        Returns the character to record, or None while a dead key is still pending.
+        """
+        dead, self._dead = self._dead, None
+        if dead_diacritic(key, ch) is not None:
+            self._dead = ch
+            return dead  # pressing two dead keys types the first one literally
+        return compose_dead(dead, ch) if dead else ch
 
     def _on_click(self, x, y, button, pressed):
         if self.paused:
@@ -128,20 +257,22 @@ class Recorder:
                 return
             self._flush()
             self._win_candidate = False
-            self._press = (x, y, button, time.monotonic(), self._delay())
+            self._press = (x, y, button, time.monotonic(), self._delay(),
+                           self._active_mods())
             return
         # release: far from the press point -> it was a drag, else a click
         p, self._press = self._press, None
         if p is None:
             return
-        x1, y1, btn, t0, delay = p
+        x1, y1, btn, t0, delay, mods = p
         if (x - x1) ** 2 + (y - y1) ** 2 >= 100:  # moved 10px or more
-            self.steps.append({"t": "drag", "x": x1, "y": y1, "x2": x, "y2": y,
-                               "button": btn.name,
-                               "dur": round(time.monotonic() - t0, 3), "delay": delay})
+            step = {"t": "drag", "x": x1, "y": y1, "x2": x, "y2": y, "button": btn.name,
+                    "dur": round(time.monotonic() - t0, 3), "delay": delay}
         else:
-            self.steps.append({"t": "click", "x": x1, "y": y1,
-                               "button": btn.name, "delay": delay})
+            step = {"t": "click", "x": x1, "y": y1, "button": btn.name, "delay": delay}
+        if mods:  # Ctrl+click, Shift+click, … — omitted entirely when unmodified
+            step["mods"] = mods
+        self.steps.append(step)
         self._last = time.monotonic()  # next delay counts from the release
 
     def _on_scroll(self, x, y, dx, dy):
@@ -149,14 +280,26 @@ class Recorder:
             return
         self._win_candidate = False
         d = self._delay()
+        mods = self._active_mods()
         last = self.steps[-1] if self.steps else None
-        # coalesce a burst of wheel notches into one step
+        # coalesce a burst of wheel notches into one step, but only same axis and same
+        # modifiers — a Ctrl+scroll zoom must not fold into a plain scroll
         if (not self._text and last and last["t"] == "scroll" and d < 0.3
-                and (dy > 0) == (last["dy"] > 0)):
+                and last.get("mods", []) == mods
+                and (dx > 0) == (last.get("dx", 0) > 0)
+                and (dy > 0) == (last.get("dy", 0) > 0)):
             last["dy"] += dy
+            last["dx"] = last.get("dx", 0) + dx
+            if not last["dx"]:
+                last.pop("dx", None)
             return
         self._flush()
-        self.steps.append({"t": "scroll", "x": x, "y": y, "dy": dy, "delay": d})
+        step = {"t": "scroll", "x": x, "y": y, "dy": dy, "delay": d}
+        if dx:  # horizontal wheel / tilt / trackpad — usually zero, so kept optional
+            step["dx"] = dx
+        if mods:
+            step["mods"] = mods
+        self.steps.append(step)
 
     def _on_press(self, key):
         if key == STOP_KEY:
@@ -183,6 +326,15 @@ class Recorder:
         ch = getattr(key, "char", None)
         if key == Key.space:
             ch = " "
+        # Alt held + numpad digits is Windows' character-code entry ("Alt+0152" -> "˜").
+        # Collect the digits; the character only exists once Alt is released, and it is
+        # recorded as text so replay types it directly instead of re-entering the code.
+        if self._mods == {"alt"} and not self._shift:
+            digit = NUMPAD_DIGITS.get(getattr(key, "vk", None))
+            if digit is not None:
+                self._alt_code += digit
+                self._win_candidate = False
+                return
         if self._mods:  # ctrl/alt/win held -> hotkey combo
             name = None
             if ch:
@@ -190,13 +342,15 @@ class Recorder:
             elif key in SPECIAL:
                 name = SPECIAL[key]
             if name:
-                mods = sorted(self._mods) + (["shift"] if self._shift else [])
                 self._flush()
-                self.steps.append({"t": "hotkey", "keys": mods + [name],
+                self.steps.append({"t": "hotkey", "keys": self._active_mods() + [name],
                                    "delay": self._delay()})
                 self._win_candidate = False
             return
         if ch and (ch.isprintable() or ch == " "):
+            ch = self._compose(key, ch)
+            if ch is None:
+                return  # dead key held back until we know what it accents
             if not self._text:
                 self._text_delay = self._delay()
             else:
@@ -213,6 +367,17 @@ class Recorder:
     def _on_release(self, key):
         if key in MODS:
             self._mods.discard(MODS[key])
+            if MODS[key] == "alt" and self._alt_code:
+                # releasing Alt is what makes the character appear
+                code, self._alt_code = self._alt_code, ""
+                ch = alt_numpad_char(code)
+                if ch and not self.paused:
+                    if not self._text:
+                        self._text_delay = self._delay()
+                    else:
+                        self._delay()
+                    self._text += ch
+                return
             if MODS[key] == "win" and self._win_candidate and not self.paused:
                 self._win_candidate = False
                 self._flush()
@@ -223,10 +388,49 @@ class Recorder:
 
 # ---------------------------------------------------------------- playback
 
+# raw mouse_event flags for the back/forward buttons pyautogui can't drive
+_ME = {"x1": (0x0080, 0x0100, 1), "x2": (0x0080, 0x0100, 2)}  # down, up, XBUTTON n
+
+
+@contextlib.contextmanager
+def held_mods(mods):
+    """Hold ctrl/alt/win/shift down for the duration of a click or scroll, so a
+    recorded Ctrl+click or Ctrl+scroll replays as the modified action, not a bare one."""
+    import pyautogui
+    for m in mods:
+        pyautogui.keyDown(m, _pause=False)
+    try:
+        yield
+    finally:
+        for m in reversed(mods):
+            pyautogui.keyUp(m, _pause=False)
+
+
+def mouse_action(x, y, button, down=False, up=False):
+    """Click (default), or press/release for a drag. Handles x1/x2 via mouse_event,
+    which pyautogui rejects; left/middle/right go through pyautogui as before."""
+    import pyautogui
+    if button in _ME:
+        dn, up_flag, xb = _ME[button]
+        pyautogui.moveTo(x, y, _pause=False)
+        if not up:
+            ctypes.windll.user32.mouse_event(dn, 0, 0, xb, 0)
+        if not down:
+            ctypes.windll.user32.mouse_event(up_flag, 0, 0, xb, 0)
+        return
+    if down:
+        pyautogui.mouseDown(x, y, button=button, _pause=False)
+    elif up:
+        pyautogui.mouseUp(x, y, button=button, _pause=False)
+    else:
+        pyautogui.click(x, y, button=button)
+
+
 def describe(step):
     t = step["t"]
+    mod = "".join(m + "+" for m in step.get("mods", []))  # "ctrl+" prefix, or ""
     if t == "click":
-        return f"{step['button']} click at ({step['x']}, {step['y']})"
+        return f"{mod}{step['button']} click at ({step['x']}, {step['y']})"
     if t == "text":
         txt = step["text"] if len(step["text"]) <= 40 else step["text"][:37] + "..."
         return f'type "{txt}"'
@@ -235,9 +439,11 @@ def describe(step):
     if t == "hotkey":
         return "press [" + " + ".join(step["keys"]) + "]"
     if t == "scroll":
-        return f"scroll {'up' if step['dy'] > 0 else 'down'} {abs(step['dy'])} at ({step['x']}, {step['y']})"
+        axis = (f"{'up' if step['dy'] > 0 else 'down'} {abs(step['dy'])}" if step.get("dy")
+                else f"{'right' if step.get('dx', 0) > 0 else 'left'} {abs(step.get('dx', 0))}")
+        return f"{mod}scroll {axis} at ({step['x']}, {step['y']})"
     if t == "drag":
-        return (f"drag from ({step['x']}, {step['y']}) "
+        return (f"{mod}drag from ({step['x']}, {step['y']}) "
                 f"to ({step['x2']}, {step['y2']})")
     if t == "path":
         dur = sum(p[2] for p in step["points"])
@@ -376,17 +582,21 @@ def play(steps, on_step=None, cancel=None, pause=None, fixed_delay=None):
                 glide(x, y, dur)  # animated slide to the target instead of teleporting
             if cancelled():
                 return False
-            if t == "click":
-                pyautogui.click(x, y, button=s["button"])
-            elif t == "drag":
-                pyautogui.mouseDown(button=s["button"], _pause=False)
-                time.sleep(0.05)
-                glide(s["x2"], s["y2"], max(0.15, min(s.get("dur", 0.3), 2)))
-                time.sleep(0.05)
-                pyautogui.mouseUp(button=s["button"], _pause=False)
-            else:
-                # ponytail: 120 = one wheel notch on Windows; make configurable if a mouse/app disagrees
-                pyautogui.scroll(int(s["dy"] * 120))
+            with held_mods(s.get("mods", [])):  # Ctrl+click, Shift+click, Ctrl+scroll…
+                if t == "click":
+                    mouse_action(x, y, s["button"])
+                elif t == "drag":
+                    mouse_action(x, y, s["button"], down=True)
+                    time.sleep(0.05)
+                    glide(s["x2"], s["y2"], max(0.15, min(s.get("dur", 0.3), 2)))
+                    time.sleep(0.05)
+                    mouse_action(s["x2"], s["y2"], s["button"], up=True)
+                else:
+                    # ponytail: 120 = one wheel notch on Windows; make configurable if a mouse/app disagrees
+                    if s["dy"]:
+                        pyautogui.scroll(int(s["dy"] * 120))
+                    if s.get("dx"):
+                        pyautogui.hscroll(int(s["dx"] * 120))
             continue
         if not wait(delay):
             return False
@@ -406,9 +616,76 @@ def play(steps, on_step=None, cancel=None, pause=None, fixed_delay=None):
     return True
 
 
+def wait_before_play(secs, cancel, on_left):
+    """Grace period before playback, polled rather than slept so Esc still works.
+
+    The sign-in launcher waits 300s; a plain sleep there left the HUD on screen and
+    unresponsive for five minutes, which reads as a freeze. `on_left` is called with
+    the whole seconds remaining. Returns False if cancelled during the wait.
+    """
+    end = time.perf_counter() + max(0, secs)
+    while True:
+        left = end - time.perf_counter()
+        if left <= 0:
+            return True
+        if cancel():
+            return False
+        on_left(int(left + 0.999))
+        time.sleep(0.1)
+
+
 def load_recording(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+# required keys per step type — the shape play() relies on
+_STEP_KEYS = {
+    "click": ("x", "y", "button"), "drag": ("x", "y", "x2", "y2", "button"),
+    "scroll": ("x", "y"), "text": ("text",), "key": ("key",),
+    "hotkey": ("keys",), "path": ("points",),
+}
+
+
+def recording_error(data):
+    """A plain-language reason the recording can't be played, or None if it's fine.
+
+    Guards playback against a file that's been hand-edited, truncated, or built by some
+    other tool — better a clear message than a mid-run crash driving the mouse."""
+    if not isinstance(data, dict):
+        return "This file isn't a Pointerizer recording."
+    steps = data.get("steps")
+    if not isinstance(steps, list):
+        return "The recording has no list of steps."
+    if not steps:
+        return "The recording is empty — there's nothing to play."
+    for i, s in enumerate(steps, 1):
+        if not isinstance(s, dict) or "t" not in s:
+            return f"Step {i} is malformed."
+        keys = _STEP_KEYS.get(s["t"])
+        if keys is None:
+            return f"Step {i} is an unknown type ('{s['t']}')."
+        missing = [k for k in keys if k not in s]
+        if missing:
+            return f"Step {i} ({s['t']}) is missing {', '.join(missing)}."
+    return None
+
+
+LOG_PATH = BASE_DIR / "pointerizer-activity.log"
+
+
+def log_run(name, outcome):
+    """Append one line to the activity log so scheduled runs aren't invisible.
+    Trims itself so it can't grow without bound."""
+    line = f"{datetime.now().isoformat(timespec='seconds')}  {name}  {outcome}\n"
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+        if LOG_PATH.stat().st_size > 200_000:  # keep the last ~500 lines
+            tail = LOG_PATH.read_text(encoding="utf-8").splitlines()[-500:]
+            LOG_PATH.write_text("\n".join(tail) + "\n", encoding="utf-8")
+    except OSError:
+        pass  # logging must never break a run
 
 
 def save_recording(name, steps, fixed_delay=None):
@@ -433,22 +710,54 @@ def startup_path(name):
     return STARTUP_DIR / f"Pointerizer - {name}.cmd"
 
 
+def startup_script(name):
+    """The exact .cmd contents the sign-in launcher for `name` should have today.
+
+    Note it passes --signin, not --wait N: the delay is the app's to decide, so a new
+    release can change it without every existing launcher needing to be rewritten.
+    """
+    target = RECORDINGS_DIR / f"{name}.json"
+    if getattr(sys, "frozen", False):
+        cmd = f'start "" "{sys.executable}" --play "{target}" --signin'
+    else:
+        cmd = (f'start "" "{sys.executable}" "{Path(__file__).resolve()}"'
+               f' --play "{target}" --signin')
+    # UTF-8 + chcp, not mbcs: names may hold characters the system ANSI codepage can't
+    # encode (any non-Latin script on a western install), and mbcs raises on those.
+    return "@echo off\nchcp 65001 >nul\n" + cmd + "\n"
+
+
 def set_startup(name, enabled):
     """Create/remove a launcher in the user's Startup folder (runs at Windows sign-in)."""
     p = startup_path(name)
     if not enabled:
         p.unlink(missing_ok=True)
         return
-    target = RECORDINGS_DIR / f"{name}.json"
-    # --wait 300: give the desktop 5 minutes to settle after sign-in
-    if getattr(sys, "frozen", False):
-        cmd = f'start "" "{sys.executable}" --play "{target}" --wait 300'
-    else:
-        cmd = (f'start "" "{sys.executable}" "{Path(__file__).resolve()}"'
-               f' --play "{target}" --wait 300')
-    # UTF-8 + chcp, not mbcs: names may hold characters the system ANSI codepage can't
-    # encode (any non-Latin script on a western install), and mbcs raises on those.
-    p.write_text("@echo off\nchcp 65001 >nul\n" + cmd + "\n", encoding="utf-8")
+    want = startup_script(name)
+    try:
+        if p.read_text(encoding="utf-8") == want:
+            return  # already current — don't touch the Startup folder needlessly
+    except OSError:
+        pass
+    p.write_text(want, encoding="utf-8")
+
+
+def refresh_startup_launchers():
+    """Bring launchers written by older versions up to the current command line.
+
+    Older builds baked `--wait 300` into the .cmd, and the exe path into it besides, so
+    neither a changed delay nor a reinstall to a different folder reached anyone who had
+    already ticked the box. Rewriting on launch repairs those in place; set_startup is a
+    no-op when the file already matches.
+    """
+    try:
+        stale = list(STARTUP_DIR.glob("Pointerizer - *.cmd"))
+    except OSError:
+        return
+    for f in stale:
+        name = f.stem[len("Pointerizer - "):]
+        if (RECORDINGS_DIR / f"{name}.json").exists():
+            set_startup(name, True)
 
 
 # ---------------------------------------------------------------- UI
@@ -497,14 +806,21 @@ QPushButton#accent { background: #f5c542; border: none; color: #0d0d0d; }
 QPushButton#accent:hover { background: #ffd35c; }
 QPushButton#rowbtn { background: transparent; border: none; border-radius: 6px; padding: 0; }
 QPushButton#rowbtn:hover { background: #3a3a3a; }
+QPushButton#link { background: transparent; border: none; color: #9b9b9b;
+                   font-size: 12px; padding: 2px 6px; }
+QPushButton#link:hover { color: #ececec; }
+QPushButton#link:disabled { color: #565656; }
 QPushButton#daychip { background: transparent; border: 1px solid #3a3a3a; color: #9b9b9b;
                       padding: 6px 0; border-radius: 14px; font-size: 12px;
                       font-weight: 500; min-width: 0; }
 QPushButton#daychip:hover { background: #2a2a2a; }
 QPushButton#daychip:checked { background: #ececec; color: #0d0d0d;
                               border: 1px solid #ececec; }
-QPushButton#pillbtn { background: #f5c542; color: #0d0d0d; border: none; }
-QPushButton#pillbtn:hover { background: #ffd35c; }
+/* the border matters: with `border: none` Qt paints the background as a plain rect and
+   border-radius never clips it, which is what left these buttons square. It matches the
+   fill, so it costs nothing visually. */
+QPushButton#pillbtn { background: #f5c542; color: #0d0d0d; border: 1px solid #f5c542; }
+QPushButton#pillbtn:hover { background: #ffd35c; border-color: #ffd35c; }
 QComboBox, QSpinBox, QTimeEdit { background: #181818; border: 1px solid #3a3a3a;
                                  border-radius: 8px; padding: 6px 10px; }
 QComboBox:focus, QSpinBox:focus, QTimeEdit:focus { border-color: #6e6e6e; }
@@ -522,17 +838,10 @@ QCheckBox::indicator:checked { background: #dc2626; border-color: #dc2626; }
 QFrame#pill { background: #2b2b2b; border: 1px solid #4a4a4a; border-radius: 23px; }
 QLabel#recdot { color: #f93a37; font-size: 15px; }
 QPushButton#pillbtn { border-radius: 15px; padding: 7px 14px; }
-QPushButton#pillfinish { background: #dc2626; color: #ffffff; border: none;
+QPushButton#pillfinish { background: #dc2626; color: #ffffff; border: 1px solid #dc2626;
                          border-radius: 15px; padding: 7px 14px; }
-QPushButton#pillfinish:hover { background: #ef3b3b; }
+QPushButton#pillfinish:hover { background: #ef3b3b; border-color: #ef3b3b; }
 QLabel#playdot { font-size: 15px; }
-/* playback pill buttons: same colours/geometry as the recording pill's, but with an
-   explicit border. With `border: none` Qt draws the background as a plain rect and the
-   radius never clips — the surrounding QFrame#pill rounds precisely because it has one. */
-QPushButton#playpause { background: #f5c542; color: #0d0d0d;
-                        border: 1px solid #f5c542; border-radius: 15px; padding: 7px 14px; }
-QPushButton#playcancel { background: #dc2626; color: #ffffff;
-                         border: 1px solid #dc2626; border-radius: 15px; padding: 7px 14px; }
 """
 
 
@@ -563,6 +872,12 @@ class Border(QtWidgets.QWidget):
         p.drawRect(self.rect().adjusted(2, 2, -3, -3))
 
 
+def fit(widget, *texts):
+    """Widest of `texts` in the widget's own (polished) font, in pixels."""
+    fm = widget.fontMetrics()
+    return max(fm.horizontalAdvance(t) for t in texts)
+
+
 class PlaybackHud:
     """Screen borders plus a floating pill, so a replay is always visible and its
     controls discoverable. Used by the GUI and by scheduled runs alike.
@@ -588,32 +903,63 @@ class PlaybackHud:
         h.setSpacing(10)
         self._dot = QtWidgets.QLabel("●", objectName="playdot")
         self._status = QtWidgets.QLabel()
-        # Same colours and geometry as the recording pill's buttons; see the stylesheet
-        # for why these need their own rules rather than reusing #pillbtn/#pillfinish.
+        # The recording pill's own button styles, so the two pills cannot drift apart.
         # Never clicked (the window is click-through), hence no focus and no hover.
-        self._pause_chip = QtWidgets.QPushButton(objectName="playpause")
-        cancel_chip = QtWidgets.QPushButton("Cancel (Esc)", objectName="playcancel")
+        self._pause_chip = QtWidgets.QPushButton(objectName="pillbtn")
+        cancel_chip = QtWidgets.QPushButton("Cancel (Esc)", objectName="pillfinish")
         for b in (self._pause_chip, cancel_chip):
             b.setFocusPolicy(QtCore.Qt.NoFocus)
             b.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
-        # size for the longer caption so the pill doesn't jitter when it toggles
-        fm = self._pause_chip.fontMetrics()
-        self._pause_chip.setFixedWidth(
-            max(fm.horizontalAdvance(t) for t in ("Pause (F7)", "Resume (F7)")) + 36)
-        self._status.setFixedWidth(
-            max(fm.horizontalAdvance(t) for t in ("Playing", "Paused")) + 6)
         h.addWidget(self._dot)
         h.addWidget(self._status)
         h.addSpacing(6)
         h.addWidget(self._pause_chip)
         h.addWidget(cancel_chip)
+        # Size each caption for its widest text so the pill never jitters as the
+        # countdown ticks or the chip flips. ensurePolished() first: before the widget
+        # is polished, fontMetrics() reports the default app font rather than the one
+        # the stylesheet sets, and the labels come out too narrow and clip.
+        self._pill.ensurePolished()
+        self._pause_chip.setFixedWidth(fit(self._pause_chip, "Pause (F7)", "Resume (F7)")
+                                       + 30)  # + the stylesheet's 14px side padding
+        # two widths, swapped per state: sizing the running pill for "Starting in 0:00"
+        # would leave a dead gap between "Playing" and the buttons. Within each state
+        # the width is constant (M:SS never changes width), so nothing jitters.
+        self._w_running = fit(self._status, "Playing", "Paused") + 8
+        self._w_waiting = fit(self._status, "Starting in 0:00") + 8
         self._screen = qapp.primaryScreen()
         self._paused = None  # None = never set, so the first sync() always paints
 
-    def show(self):
+    def show(self, counting_down=False):
         for b in self._borders:
             b.show()
-        self.sync(False)
+        if counting_down:
+            self.countdown(0)
+        else:
+            self.sync(False)
+
+    def _place(self):
+        # captions change width between states; without re-activating the layout the
+        # already-shown window keeps its old size and clips the longer text
+        self._pill.layout().activate()
+        self._pill.resize(self._pill.sizeHint())
+        geo = self._screen.geometry()
+        self._pill.move(geo.center().x() - self._pill.width() // 2, geo.top() + 24)
+        self._pill.show()
+        self._pill.raise_()
+
+    def countdown(self, secs):
+        """Pre-roll: the HUD is up but nothing is being driven yet. Says so, rather
+        than showing 'Playing' over a flow that has not started."""
+        if self._paused != "waiting":
+            self._paused = "waiting"
+            for b in self._borders:
+                b.set_color(PLAY_BORDER)
+            self._dot.setStyleSheet(f"color: {PLAY_BORDER};")
+            self._pause_chip.hide()  # nothing to pause yet; Esc still cancels
+            self._status.setFixedWidth(self._w_waiting)
+        self._status.setText(f"Starting in {secs // 60}:{secs % 60:02d}")
+        self._place()
 
     def sync(self, paused):
         """Repaint for the current pause state. Cheap to call repeatedly."""
@@ -624,16 +970,11 @@ class PlaybackHud:
         for b in self._borders:
             b.set_color(colour)
         self._dot.setStyleSheet(f"color: {colour};")
+        self._status.setFixedWidth(self._w_running)  # narrower than the countdown state
         self._status.setText("Paused" if paused else "Playing")
         self._pause_chip.setText("Resume (F7)" if paused else "Pause (F7)")
-        # the labels change width between states; without re-activating the layout the
-        # already-shown window keeps its old size and clips the longer text
-        self._pill.layout().activate()
-        self._pill.resize(self._pill.sizeHint())
-        geo = self._screen.geometry()
-        self._pill.move(geo.center().x() - self._pill.width() // 2, geo.top() + 24)
-        self._pill.show()
-        self._pill.raise_()
+        self._pause_chip.show()
+        self._place()
 
     def close(self):
         self._pill.close()
@@ -697,36 +1038,38 @@ def run_ui():
     ICON_FACTOR = 0.88  # glyph size vs box: these MDL2 glyphs nearly fill the em, so
     #                     leave a small margin to avoid horizontal clipping
 
-    def fluent_icon(glyph, color="#ececec", size=15, bias=0.0):
-        # Render the glyph into a pixmap that is TALLER than `size` by 2*bias, so the
-        # downward `bias` shift (which aligns the icon with adjacent button text) has
-        # headroom and never clips. iconSize is set to match, so nothing is squashed.
+    def fluent_icon(glyph, color="#ececec", size=15, box=None):
+        # Centre the glyph's INK in the pixmap. drawText(AlignCenter) centres the font's
+        # line box instead, and these glyphs sit at different heights within it — every
+        # icon then hung below its label, which a hand-tuned downward nudge used to
+        # paper over. Qt centres the pixmap against the text, so a centred ink lines up.
+        # `box` renders at the button's own size (for icon-only buttons): Qt's centring
+        # of a small icon inside a button is a couple of px off, so filling the button
+        # and centring here instead puts the glyph dead centre.
+        bw, bh = box or (size, size)
         dpr = qapp.devicePixelRatio() or 1
-        S = max(1, round(size * dpr))
-        D = round(bias * dpr)
-        H = S + 2 * D
-        pm = QtGui.QPixmap(S, H)
+        W, H = max(1, round(bw * dpr)), max(1, round(bh * dpr))
+        pm = QtGui.QPixmap(W, H)
         pm.setDevicePixelRatio(dpr)
         pm.fill(QtCore.Qt.transparent)
         p = QtGui.QPainter(pm)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         p.setRenderHint(QtGui.QPainter.TextAntialiasing)
         f = QtGui.QFont(icon_font)
-        f.setPixelSize(max(1, round(S * ICON_FACTOR)))
+        f.setPixelSize(max(1, round(size * dpr * ICON_FACTOR)))
         p.setFont(f)
         p.setPen(QtGui.QColor(color))
-        # glyph centered in the box, then shifted down by D (rect origin at 2D)
-        p.drawText(QtCore.QRectF(0, 2 * D, S, S),
-                   QtCore.Qt.AlignCenter | QtCore.Qt.TextDontClip, glyph)
+        # tightBoundingRect is relative to the text origin (its top is above the
+        # baseline, hence negative), so subtracting it lands the ink where we want it
+        ink = QtGui.QFontMetricsF(f).tightBoundingRect(glyph)
+        p.drawText(QtCore.QPointF((W - ink.width()) / 2 - ink.left(),
+                                  (H - ink.height()) / 2 - ink.top()), glyph)
         p.end()
         return QtGui.QIcon(pm)
 
-    TEXT_BIAS = 2.0  # nudge icons down to sit on the text midline (icon+text buttons)
-
-    def set_btn_icon(btn, glyph, color="#ececec", size=15, with_text=True):
-        bias = TEXT_BIAS if with_text else 0.0
-        btn.setIcon(fluent_icon(glyph, color, size, bias))
-        btn.setIconSize(QtCore.QSize(size, round(size + 2 * bias)))
+    def set_btn_icon(btn, glyph, color="#ececec", size=15, box=None):
+        btn.setIcon(fluent_icon(glyph, color, size, box))
+        btn.setIconSize(QtCore.QSize(*(box or (size, size))))
 
     # Qt's built-in combo/spin arrows are black — invisible on our dark fields.
     # Point the stylesheet at the light chevron PNGs bundled in assets/.
@@ -734,8 +1077,8 @@ def run_ui():
     chev_up = str(asset_dir / "chevron_up.png").replace("\\", "/")
     qapp.setStyleSheet(STYLE + f'''
 QComboBox::down-arrow {{ image: url("{chev_down}"); width: 12px; height: 12px; }}
-QSpinBox::down-arrow {{ image: url("{chev_down}"); width: 10px; height: 10px; }}
-QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
+QSpinBox::down-arrow, QTimeEdit::down-arrow {{ image: url("{chev_down}"); width: 10px; height: 10px; }}
+QSpinBox::up-arrow, QTimeEdit::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
 ''')
 
     GLYPH_CHECK, GLYPH_REDO, GLYPH_STOP, GLYPH_CLOCK, GLYPH_FLAG = (
@@ -815,8 +1158,13 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
     myflows = QtWidgets.QLabel("My Flows", objectName="section")
     header.addWidget(myflows)
     header.addStretch(1)
+    import_btn = QtWidgets.QPushButton("Import", objectName="link")
+    export_btn = QtWidgets.QPushButton("Export", objectName="link")
+    for b in (import_btn, export_btn):
+        b.setCursor(QtCore.Qt.PointingHandCursor)
+        header.addWidget(b)
     del_icon = QtWidgets.QPushButton(objectName="trashbtn")  # shown only when flows selected
-    set_btn_icon(del_icon, GLYPH_TRASH, "#ffffff", 15, with_text=False)
+    set_btn_icon(del_icon, GLYPH_TRASH, "#ffffff", 15, box=(30, 26))  # centred in the button
     del_icon.setFixedSize(30, 26)
     del_icon.setCursor(QtCore.Qt.PointingHandCursor)
     sp = del_icon.sizePolicy()
@@ -851,7 +1199,7 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
     layout.addWidget(status)
 
     state = {"recorder": None, "name": "", "play_result": None, "pill_rect": None,
-             "hud": None, "play_flags": None}
+             "hud": None, "play_flags": None, "pre_roll": None}
     overlays = []
 
     def show_overlays(color):
@@ -879,13 +1227,12 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
 
     def pill_dragged():
         rec = state["recorder"]
-        if not rec:
-            return
-        if rec.steps or rec._text:
-            # mid-flow: pause at a checkpoint; Continue (F8) resets the clock
-            rec.checkpoint_requested = True
-        else:
-            # nothing recorded yet: just restart the clock, no pause needed
+        if rec and not rec.paused:  # while paused at a checkpoint, Continue resets the
+            #                         clock itself — resuming here would un-pause it
+            # Moving the pill is not part of the flow, so it interrupts nothing: the
+            # click itself is already dropped by in_own_ui, and resetting the clock
+            # here discards the time spent dragging. Recording carries straight on
+            # from the last real action — use F8 when you actually want a checkpoint.
             rec.resume()
 
     pill = Pill(request_checkpoint, request_stop,
@@ -925,6 +1272,9 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         else:
             checked.discard(name) if name in checked else checked.add(name)
             anchor["name"] = name
+        # ticking a box also makes that flow the current row, so the sign-in toggle
+        # (bound via currentItemChanged) applies to it without a second click on the row
+        select_by_name(name)
         sync_row_checks()
         update_del_bar()
 
@@ -974,7 +1324,7 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         for glyph, tip, fn in ((GLYPH_PENCIL, "Rename", rename_flow),
                                (GLYPH_CLOCK, "Schedule", show_schedule)):
             b = QtWidgets.QPushButton(objectName="rowbtn", toolTip=tip)
-            set_btn_icon(b, glyph, "#9b9b9b", 13, with_text=False)
+            set_btn_icon(b, glyph, "#9b9b9b", 13)
             b.setFixedSize(28, 28)
             b.clicked.connect(lambda _=False, f=fn, n=name: (select_by_name(n), f(n)))
             h.addWidget(b)
@@ -1130,7 +1480,9 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         win.setEnabled(False)  # block interactions with the app while recording
         win.hide()
         show_overlays("#f93a37")
-        scr = win.screen().geometry()  # the screen the app lives on
+        # availableGeometry, not geometry: it already excludes the taskbar, so the pill
+        # clears it whatever its height or edge, and the margin is a real gap
+        scr = win.screen().availableGeometry()
         pill.adjustSize()
         pill.move(scr.center().x() - pill.width() // 2,
                   scr.bottom() - pill.height() - 48)
@@ -1203,18 +1555,32 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         if not path:
             status.setText("Select a recording first.")
             return
-        data = load_recording(path)
+        try:
+            data = load_recording(path)
+        except (OSError, json.JSONDecodeError):
+            status.setText("Couldn't read that recording — the file looks damaged.")
+            return
+        problem = recording_error(data)
+        if problem:
+            status.setText(problem)
+            return
         set_busy(True)
         win.hide()
         state["hud"] = PlaybackHud(qapp)
-        state["hud"].show()
+        state["hud"].show(counting_down=True)
         flags = state["play_flags"] = {"cancel": False, "paused": False}
+        pre = state["pre_roll"] = {"left": 2, "running": False}
 
         def worker():
             lst = playback_listener(flags)
             lst.start()
-            time.sleep(2)  # give the user's target window time to be in front
             try:
+                # 2s to bring the target window to front — Esc works during it too
+                if not wait_before_play(2, lambda: flags["cancel"],
+                                        lambda n: pre.__setitem__("left", n)):
+                    state["play_result"] = "Playback cancelled (Esc)"
+                    return
+                pre["running"] = True
                 if play(data["steps"], cancel=lambda: flags["cancel"],
                         pause=lambda: flags["paused"],
                         fixed_delay=data.get("fixed_delay")):
@@ -1231,9 +1597,9 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         play_poll.start()
 
     def on_play_poll():
-        hud, flags = state.get("hud"), state.get("play_flags")
-        if hud and flags:
-            hud.sync(flags["paused"])  # yellow border + pill, repainted on the Qt thread
+        hud, flags, pre = state.get("hud"), state.get("play_flags"), state.get("pre_roll")
+        if hud and flags and pre:  # repainted on the Qt thread; playback runs off it
+            hud.sync(flags["paused"]) if pre["running"] else hud.countdown(pre["left"])
         if state["play_result"] is None:
             return
         play_poll.stop()
@@ -1245,6 +1611,7 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         win.activateWindow()
         set_busy(False)
         status.setText(state["play_result"])
+        log_run(selected_name() or "?", state["play_result"])
 
     play_poll.timeout.connect(on_play_poll)
 
@@ -1283,6 +1650,44 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
             delete_checked()
         elif selected_name():
             delete_flow(selected_name())
+
+    def do_import():
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            win, "Import recordings", "", "Pointerizer recordings (*.json)")
+        added = 0
+        for f in files:
+            try:
+                data = load_recording(Path(f))
+            except (OSError, json.JSONDecodeError):
+                data = None
+            if data is None or recording_error(data):
+                status.setText(f"'{Path(f).stem}' isn't a valid recording — skipped.")
+                continue
+            base = re.sub(r"[^\w\- ]", "", str(data.get("name") or Path(f).stem)) or "Imported"
+            name = unique_name(base)
+            data["name"] = name
+            data.pop("schedule", None)  # a schedule belongs to the machine, not the file
+            with open(RECORDINGS_DIR / f"{name}.json", "w", encoding="utf-8") as out:
+                json.dump(data, out, indent=1)
+            added += 1
+        if added:
+            status.setText(f"Imported {added} recording(s).")
+            refresh()
+
+    def do_export():
+        name = selected_name()
+        if not name:
+            status.setText("Select a flow to export first.")
+            return
+        dest, _ = QtWidgets.QFileDialog.getSaveFileName(
+            win, "Export recording", f"{name}.json", "Pointerizer recording (*.json)")
+        if not dest:
+            return
+        try:
+            Path(dest).write_bytes((RECORDINGS_DIR / f"{name}.json").read_bytes())
+            status.setText(f"Exported '{name}'.")
+        except OSError as e:
+            status.setText(f"Couldn't export: {e}")
 
     def rename_flow(name):
         src = RECORDINGS_DIR / f"{name}.json"
@@ -1450,20 +1855,13 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
         freq = QtWidgets.QComboBox()
         freq.addItems(["Daily", "Hourly", "Weekly"])
         now = QtCore.QTime.currentTime().addSecs(600)
-        hour = QtWidgets.QComboBox()
-        hour.addItems([f"{h:02d}" for h in range(24)])
-        hour.setCurrentText(f"{now.hour():02d}")
-        hour.setFixedWidth(72)
-        minute = QtWidgets.QComboBox()
-        minute.addItems([f"{m:02d}" for m in range(0, 60, 5)])
-        minute.setCurrentText(f"{now.minute() // 5 * 5:02d}")
-        minute.setFixedWidth(72)
+        # QTimeEdit, not two dropdowns: type any HH:MM to the minute (or spin/arrow it),
+        # instead of being pinned to 5-minute steps
+        time_edit = QtWidgets.QTimeEdit(now)
+        time_edit.setDisplayFormat("HH:mm")
+        time_edit.setFixedWidth(90)
         trow = QtWidgets.QHBoxLayout()
-        colon = QtWidgets.QLabel(":")
-        colon.setStyleSheet("font-weight: 700; font-size: 16px; color: #ececec; padding: 0 3px;")
-        trow.addWidget(hour)
-        trow.addWidget(colon)
-        trow.addWidget(minute)
+        trow.addWidget(time_edit)
         trow.addStretch(1)
         repeat = QtWidgets.QSpinBox(minimum=1, maximum=100, value=1)
         repeat.setFixedWidth(90)
@@ -1502,7 +1900,7 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
 
         def do_create():
             fr = freq.currentText()
-            st = f"{hour.currentText()}:{minute.currentText()}"
+            st = time_edit.time().toString("HH:mm")
             days = [c for b, c in day_btns if b.isChecked()] if fr == "Weekly" else []
             if fr == "Weekly" and not days:
                 info.setText("Pick at least one day of the week.")
@@ -1560,6 +1958,10 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
     record_btn.clicked.connect(start_recording)
     play_btn.clicked.connect(start_playback)
     del_icon.clicked.connect(delete_checked)
+    import_btn.clicked.connect(do_import)
+    export_btn.clicked.connect(do_export)
+    export_btn.setEnabled(False)
+    listw.currentItemChanged.connect(lambda *_: export_btn.setEnabled(bool(selected_name())))
     listw.currentItemChanged.connect(sync_startup)
     listw.itemDoubleClicked.connect(lambda _it: start_playback())
     startup_cb.toggled.connect(toggle_startup)
@@ -1584,8 +1986,31 @@ QSpinBox::up-arrow {{ image: url("{chev_up}"); width: 10px; height: 10px; }}
     hot.timeout.connect(on_hot)
     hot.start()
 
+    def maybe_welcome():
+        settings = QtCore.QSettings("Pointerizer", "Pointerizer")
+        if settings.value("welcomed", False, type=bool):
+            return
+        m = QtWidgets.QMessageBox(win)
+        m.setWindowTitle("Welcome to Pointerizer")
+        m.setTextFormat(QtCore.Qt.RichText)
+        m.setText("<b>Record what you do, then replay it whenever you like.</b>")
+        m.setInformativeText(
+            "• <b>Record (F9)</b> — do your task, then press <b>F9</b> again to stop "
+            "and name it.<br>"
+            "• <b>F8</b> pauses to review as you go; <b>Esc</b> (or shoving the mouse "
+            "into a screen corner) cancels.<br>"
+            "• <b>Play</b> a saved flow, or schedule it to run on its own.<br><br>"
+            "Your recordings are plain files you can export and share. One tip: avoid "
+            "recording passwords, since they're saved as readable text.")
+        m.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        m.button(QtWidgets.QMessageBox.Ok).setText("Got it")
+        m.exec()
+        settings.setValue("welcomed", True)  # shown once; Esc counts as seen
+
+    refresh_startup_launchers()  # repair launchers left by an older build
     refresh()
     win.show()
+    maybe_welcome()
     qapp.exec()
 
 
@@ -1611,6 +2036,12 @@ def selfcheck():
     path = save_recording("_selfcheck", steps)
     loaded = load_recording(path)
     assert loaded["steps"] == steps
+    # recording validation: good file passes, common breakages give a reason
+    assert recording_error(loaded) is None
+    assert recording_error({"steps": []})                       # empty
+    assert recording_error({"steps": [{"t": "click", "x": 1}]}) # click missing y/button
+    assert recording_error({"steps": [{"t": "wat"}]})           # unknown type
+    assert recording_error("not a dict")
     assert "fixed_delay" not in loaded  # keeping original timing writes no override
     fixed = load_recording(save_recording("_selfcheck", steps, FIXED_DELAY))
     assert fixed["fixed_delay"] == FIXED_DELAY
@@ -1618,6 +2049,19 @@ def selfcheck():
     # the edit dialog toggles that key both ways; re-ticking must leave no residue
     fixed.pop("fixed_delay", None)
     assert "fixed_delay" not in fixed and fixed["steps"] == steps
+    # the pre-play wait must be interruptible — a plain sleep here made the 300s
+    # sign-in grace period look like a frozen app with a dead Esc key
+    seen = []
+    t0 = time.perf_counter()
+    assert wait_before_play(300, lambda: len(seen) >= 3, seen.append) is False
+    assert time.perf_counter() - t0 < 5, "cancel did not interrupt the wait"
+    assert seen and seen[0] == 300  # counts down from the full wait
+    assert wait_before_play(0, lambda: False, seen.append) is True
+    # the sign-in launcher must not freeze the delay into its text, or changing
+    # SIGNIN_WAIT in a later release would never reach anyone already set up
+    script = startup_script("_selfcheck")
+    assert "--signin" in script and "--wait" not in script
+    assert str(SIGNIN_WAIT) not in script
     for s in steps:
         assert describe(s)
     import pyautogui
@@ -1633,6 +2077,63 @@ def selfcheck():
     assert ctypes.sizeof(_INPUT) == (40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28)
     # a lone Windows key press is recorded (opens Start menu on replay); Win+D stays a hotkey
     from pynput.keyboard import KeyCode
+    # dead keys: "^" then "e" is one character, "ê" — not the two Windows delivers
+    assert compose_dead("^", "e") == "ê"
+    assert compose_dead("~", "a") == "ã"
+    assert compose_dead("´", "o") == "ó"
+    assert compose_dead("^", " ") == "^"   # dead key then space types the mark alone
+    assert compose_dead("^", "q") == "^q"  # no precomposed "q̂": Windows types both
+    r = Recorder()
+    r._dead = "^"                          # abandoned dead key still reaches the text
+    r._flush()
+    assert r.steps[-1]["text"] == "^" and r._dead is None
+    r = Recorder()                         # a plain letter is untouched
+    assert r._compose(KeyCode.from_char("e"), "e") == "e" and r._dead is None
+
+    # Alt + numpad character codes: the digits are swallowed and the composed
+    # character is recorded as text, so replay types it instead of re-entering the code
+    assert alt_numpad_char("0152") == "˜"   # leading zero -> ANSI codepage
+    assert alt_numpad_char("0233") == "é"
+    assert alt_numpad_char("26") == "→"     # OEM low byte -> CP437 graphic, not U+001A
+    assert alt_numpad_char("1") == "☺"
+    assert alt_numpad_char("2") == "☻"
+    assert alt_numpad_char("65") == "A"     # OEM printable range is unchanged
+    assert alt_numpad_char("0009") == "\t"  # leading-zero control stays a control char
+    assert alt_numpad_char("") is None
+    r = Recorder()
+    r._on_press(Key.alt)
+    for vk in (0x60, 0x61, 0x65, 0x62):          # numpad 0, 1, 5, 2
+        r._on_press(KeyCode.from_vk(vk))
+    assert r._alt_code == "0152" and not r.steps  # nothing emitted mid-sequence
+    r._on_release(Key.alt)
+    r._flush()
+    assert r.steps[-1]["t"] == "text" and r.steps[-1]["text"] == "˜"
+    r = Recorder()                                # Alt+Tab must stay a plain hotkey
+    r._on_press(Key.alt); r._on_press(Key.tab); r._on_release(Key.alt)
+    assert [s["t"] for s in r.steps] == ["hotkey"] and r.steps[0]["keys"] == ["alt", "tab"]
+
+    # modified clicks/scroll: the held modifier must ride along, or Ctrl+click
+    # (multi-select) and Ctrl+scroll (zoom) replay as bare actions
+    from pynput.mouse import Button
+    r = Recorder()
+    r._on_press(Key.ctrl)
+    r._on_click(9, 9, Button.left, True); r._on_click(9, 9, Button.left, False)
+    r._on_release(Key.ctrl)
+    assert r.steps[-1]["t"] == "click" and r.steps[-1]["mods"] == ["ctrl"]
+    r = Recorder()                                # plain click carries no mods key
+    r._on_click(9, 9, Button.left, True); r._on_click(9, 9, Button.left, False)
+    assert "mods" not in r.steps[-1]
+    r = Recorder()                                # Ctrl+scroll stays separate from plain
+    r._on_scroll(1, 1, 0, -1)
+    r._on_press(Key.ctrl); r._on_scroll(1, 1, 0, -1); r._on_release(Key.ctrl)
+    assert len(r.steps) == 2 and r.steps[1]["mods"] == ["ctrl"]
+    r = Recorder()                                # horizontal wheel keeps dx
+    r._on_scroll(1, 1, -2, 0)
+    assert r.steps[-1]["dx"] == -2
+    assert "left" in describe({"t": "scroll", "x": 0, "y": 0, "dx": -2, "dy": 0})
+    assert describe({"t": "click", "x": 0, "y": 0, "button": "left",
+                     "mods": ["ctrl"]}).startswith("ctrl+")
+
     r = Recorder()
     r._on_press(Key.cmd); r._on_release(Key.cmd)
     assert [(s["t"], s.get("key")) for s in r.steps] == [("key", "win")]
@@ -1650,6 +2151,9 @@ def main():
                     help="play the recording N times back-to-back (with --play)")
     ap.add_argument("--wait", type=int, default=3, metavar="SEC",
                     help="seconds to wait before playback (desktop settle time)")
+    ap.add_argument("--signin", action="store_true",
+                    help=f"sign-in run: wait {SIGNIN_WAIT}s, whatever this build's "
+                         "startup delay is, instead of --wait")
     ap.add_argument("--selfcheck", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
     if args.selfcheck:
@@ -1658,7 +2162,15 @@ def main():
         path = Path(args.play)
         if not path.exists():
             path = RECORDINGS_DIR / f"{args.play}.json"
-        data = load_recording(path)
+        try:
+            data = load_recording(path)
+            problem = recording_error(data)
+        except (OSError, json.JSONDecodeError) as e:
+            data, problem = None, f"could not read recording: {e}"
+        if problem:
+            print(problem, file=sys.stderr)
+            log_run(path.stem, problem)
+            sys.exit(1)
         flags = {"cancel": False, "paused": False}
         playback_listener(flags).start()
 
@@ -1668,9 +2180,17 @@ def main():
         qapp = QtWidgets.QApplication(sys.argv)
         apply_theme(qapp)
         hud = PlaybackHud(qapp)
-        hud.show()
-        QtCore.QTimer(qapp, interval=200,
-                      timeout=lambda: hud.sync(flags["paused"])).start()
+        wait = SIGNIN_WAIT if args.signin else args.wait
+        hud.show(counting_down=wait > 0)
+        pre = {"left": max(0, wait), "running": False}
+
+        def tick():  # HUD repaints on the Qt thread; playback runs off it
+            if pre["running"]:
+                hud.sync(flags["paused"])
+            else:
+                hud.countdown(pre["left"])
+
+        QtCore.QTimer(qapp, interval=200, timeout=tick).start()
 
         failed = []  # non-empty => exit non-zero so Task Scheduler records the failure
 
@@ -1679,7 +2199,12 @@ def main():
             # play(), and without the quit the process would sit there forever with
             # the border stuck on screen — as a scheduled task, invisibly, every run.
             try:
-                time.sleep(max(0, args.wait))  # grace period (desktop settle time)
+                # grace period (desktop settle time) — cancellable, and counted down
+                # on the pill so a long --wait doesn't look like a hang
+                if not wait_before_play(wait, lambda: flags["cancel"],
+                                        lambda n: pre.__setitem__("left", n)):
+                    return
+                pre["running"] = True
                 for _ in range(max(1, args.repeat)):
                     if not play(data["steps"], cancel=lambda: flags["cancel"],
                                 pause=lambda: flags["paused"],
@@ -1693,6 +2218,8 @@ def main():
 
         threading.Thread(target=worker, daemon=True).start()
         qapp.exec()
+        log_run(data["name"] if isinstance(data.get("name"), str) else path.stem,
+                f"aborted: {failed[0]}" if failed else "played")
         if failed:
             sys.exit(1)
     else:
