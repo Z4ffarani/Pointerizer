@@ -20,7 +20,7 @@ Your recordings are plain JSON in a `recordings\` folder next to the app.
 - **Keep my original timing** (default) — every pause you took is reproduced exactly.
 - **Unticked** — every step replays a fixed **0.35s** apart. Faster, and it strips out the thinking time. The gap is deliberately not zero: actions fired back-to-back tend to outrun the app you're driving, so 0.35s gives each one time to land. Your original timings stay in the file, so nothing is destroyed by choosing this.
 
-**Play** — click a recording and hit **Play**, or double-click it. You get 2 seconds to bring your target window to front, then it replays (the pointer glides to each target). Playback also starts from a centered cursor. A grey border frames the screen and a pill shows the controls:
+**Play** — click a recording and hit **Play**, double-click it, or select it and press **Enter**. You get 2 seconds to bring your target window to front, then it replays (the pointer glides to each target). Playback also starts from a centered cursor. A grey border frames the screen and a pill shows the controls:
 
 - **F7** — pause. The border turns yellow and the pill says so; **F7** again resumes from exactly where it stopped. Time spent paused isn't charged against the next step's delay.
 - **Esc** — cancel outright. Slamming the mouse into a screen corner also aborts.

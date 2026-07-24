@@ -868,6 +868,10 @@ QPushButton#pillbtn { border-radius: 15px; padding: 7px 14px; }
 QPushButton#pillfinish { background: #dc2626; color: #ffffff; border: 1px solid #dc2626;
                          border-radius: 15px; padding: 7px 14px; }
 QPushButton#pillfinish:hover { background: #ef3b3b; border-color: #ef3b3b; }
+/* the playback pill is click-through, so its buttons never get real :hover events —
+   the mouse hook sets this property instead, giving the same look as :hover above */
+QPushButton#pillbtn[hovered="true"] { background: #ffd35c; border-color: #ffd35c; }
+QPushButton#pillfinish[hovered="true"] { background: #ef3b3b; border-color: #ef3b3b; }
 QLabel#playdot { font-size: 15px; }
 """
 
@@ -933,17 +937,20 @@ class PlaybackHud:
     Every method must be called from the Qt thread; playback itself runs off-thread.
     """
 
-    def __init__(self, qapp, on_cancel=None):
+    def __init__(self, qapp):
         self._borders = [Border(s.geometry(), PLAY_BORDER) for s in qapp.screens()]
-        # Not WindowTransparentForInput at the Qt level: click-through is toggled per
-        # phase via WS_EX_TRANSPARENT below. During the countdown the mouse is free, so
-        # the pill is interactive and Cancel is clickable; once playback starts the mouse
-        # is being driven, so the pill goes click-through and can't swallow a driven click.
+        # Always click-through: the mouse is driven during playback, so the pill must
+        # never swallow a driven click. Its buttons are still clickable — a mouse hook
+        # (see playback_mouse_listener) fires them on a real click and lets driven clicks
+        # pass, so the pill itself never needs to grab input.
         self._pill = QtWidgets.QWidget(None, OVERLAY_FLAGS |
+                                       QtCore.Qt.WindowTransparentForInput |
                                        QtCore.Qt.WindowDoesNotAcceptFocus)
         self._pill.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         self._pill.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
-        self._clickthrough = None
+        self._hits = []  # [(x0, y0, x1, y1, action)] in screen px, for the mouse hook
+        self._hover = None       # action under the cursor, set from the hook thread
+        self._hover_shown = 0     # last hover applied on the Qt thread (sentinel != None)
         outer = QtWidgets.QHBoxLayout(self._pill)
         outer.setContentsMargins(0, 0, 0, 0)
         frame = QtWidgets.QFrame(objectName="pill")
@@ -955,18 +962,15 @@ class PlaybackHud:
         self._status = QtWidgets.QLabel()
         # The recording pill's own button styles, so the two pills cannot drift apart.
         self._pause_chip = QtWidgets.QPushButton(objectName="pillbtn")
-        self._pause_chip.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)  # F7 only
-        cancel_chip = QtWidgets.QPushButton("Cancel (Esc)", objectName="pillfinish")
-        cancel_chip.setCursor(QtCore.Qt.PointingHandCursor)  # clickable during countdown
-        if on_cancel:
-            cancel_chip.clicked.connect(on_cancel)
-        for b in (self._pause_chip, cancel_chip):
+        self._cancel_chip = QtWidgets.QPushButton("Cancel (Esc)", objectName="pillfinish")
+        for b in (self._pause_chip, self._cancel_chip):
             b.setFocusPolicy(QtCore.Qt.NoFocus)
+            b.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
         h.addWidget(self._dot)
         h.addWidget(self._status)
         h.addSpacing(6)
         h.addWidget(self._pause_chip)
-        h.addWidget(cancel_chip)
+        h.addWidget(self._cancel_chip)
         # Size each caption for its widest text so the pill never jitters as the
         # countdown ticks or the chip flips. ensurePolished() first: before the widget
         # is polished, fontMetrics() reports the default app font rather than the one
@@ -990,18 +994,27 @@ class PlaybackHud:
         else:
             self.sync(False)
 
-    def _set_clickthrough(self, on):
-        """Toggle WS_EX_TRANSPARENT so mouse events pass through (playback) or land on
-        the pill (countdown). Done in place, without re-showing the window."""
-        if on == self._clickthrough:
+    def hit(self, x, y):
+        """Which control a screen-point lands on ('cancel'/'pause'), or None. Read from
+        the mouse-hook thread; `self._hits` is only ever reassigned whole, never mutated."""
+        for x0, y0, x1, y1, action in self._hits:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return action
+        return None
+
+    def set_hover(self, action):
+        """Store the control under the cursor (called from the hook thread — no Qt)."""
+        self._hover = action
+
+    def apply_hover(self):
+        """Paint the stored hover state; called on the Qt thread from the repaint poll."""
+        if self._hover == self._hover_shown:
             return
-        self._clickthrough = on
-        hwnd = int(self._pill.winId())
-        GWL_EXSTYLE, WS_EX_TRANSPARENT = -20, 0x20
-        u = ctypes.windll.user32
-        ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        u.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                         ex | WS_EX_TRANSPARENT if on else ex & ~WS_EX_TRANSPARENT)
+        self._hover_shown = self._hover
+        for btn, action in ((self._cancel_chip, "cancel"), (self._pause_chip, "pause")):
+            btn.setProperty("hovered", "true" if self._hover == action else "false")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
 
     def _place(self):
         # captions change width between states; without re-activating the layout the
@@ -1012,6 +1025,14 @@ class PlaybackHud:
         self._pill.move(geo.center().x() - self._pill.width() // 2, geo.top() + 24)
         self._pill.show()
         self._pill.raise_()
+        # publish button rects (screen px) for the mouse hook; only visible ones count
+        hits = []
+        for btn, action in ((self._cancel_chip, "cancel"), (self._pause_chip, "pause")):
+            if btn.isVisible():
+                tl = btn.mapToGlobal(QtCore.QPoint(0, 0))
+                hits.append((tl.x(), tl.y(), tl.x() + btn.width(), tl.y() + btn.height(),
+                             action))
+        self._hits = hits
 
     def countdown(self, secs):
         """Pre-roll: the HUD is up but nothing is being driven yet. Says so, rather
@@ -1023,7 +1044,6 @@ class PlaybackHud:
             self._dot.setStyleSheet(f"color: {PLAY_BORDER};")
             self._pause_chip.hide()  # nothing to pause yet; Cancel/Esc still work
             self._status.setFixedWidth(self._w_waiting)
-            self._set_clickthrough(False)  # Cancel is clickable while we wait
         self._status.setText(f"Starting in {secs // 60}:{secs % 60:02d}")
         self._place()
 
@@ -1040,7 +1060,6 @@ class PlaybackHud:
         self._status.setText("Paused" if paused else "Playing")
         self._pause_chip.setText("Resume (F7)" if paused else "Pause (F7)")
         self._pause_chip.show()
-        self._set_clickthrough(True)  # mouse is driven now — don't intercept clicks
         self._place()
 
     def close(self):
@@ -1089,6 +1108,46 @@ def playback_listener(flags):
 
     return keyboard.Listener(on_press=on_press, on_release=on_release,
                              win32_event_filter=not_injected)
+
+
+WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0200, 0x0201, 0x0202
+LLMHF_INJECTED = 0x00000001 | 0x00000002  # MSLLHOOKSTRUCT.flags: injected / lower-IL
+
+
+def playback_mouse_listener(hud, flags):
+    """Make the pill's Pause/Cancel buttons clickable during playback without the pill
+    ever intercepting a driven click.
+
+    The pill window is click-through, so this global hook does the hit-testing itself:
+    a *real* left-click on a button fires its action and is swallowed so it doesn't also
+    reach the app; an *injected* click (our own replayed input) always passes straight
+    through. That split is the whole trick — the buttons work, driven clicks don't hit
+    them."""
+    lst = None
+    swallow_up = [False]
+
+    def filt(msg, data):
+        injected = data.flags & LLMHF_INJECTED
+        if msg == WM_MOUSEMOVE:
+            if not injected:  # only a real mouse over a button counts as hover
+                hud.set_hover(hud.hit(data.pt.x, data.pt.y))
+            return True
+        if msg == WM_LBUTTONDOWN and not injected:
+            action = hud.hit(data.pt.x, data.pt.y)
+            if action == "cancel":
+                flags["cancel"] = True
+            elif action == "pause":
+                flags["paused"] = not flags["paused"]
+            if action:
+                swallow_up[0] = True
+                lst.suppress_event()  # don't let this click leak to the app below
+        elif msg == WM_LBUTTONUP and not injected and swallow_up[0]:
+            swallow_up[0] = False
+            lst.suppress_event()
+        return True
+
+    lst = mouse.Listener(win32_event_filter=filt, on_click=lambda *a: None)
+    return lst
 
 
 def run_ui():
@@ -1638,13 +1697,15 @@ QSpinBox::up-arrow, QTimeEdit::up-arrow {{ image: url("{chev_up}"); width: 10px;
         set_busy(True)
         win.hide()
         flags = state["play_flags"] = {"cancel": False, "paused": False}
-        state["hud"] = PlaybackHud(qapp, on_cancel=lambda: flags.__setitem__("cancel", True))
-        state["hud"].show(counting_down=True)
+        hud = state["hud"] = PlaybackHud(qapp)
+        hud.show(counting_down=True)
         pre = state["pre_roll"] = {"left": 2, "running": False}
 
         def worker():
             lst = playback_listener(flags)
+            mlst = playback_mouse_listener(hud, flags)
             lst.start()
+            mlst.start()
             try:
                 # 2s to bring the target window to front — Esc works during it too
                 if not wait_before_play(2, lambda: flags["cancel"],
@@ -1662,6 +1723,7 @@ QSpinBox::up-arrow, QTimeEdit::up-arrow {{ image: url("{chev_up}"); width: 10px;
                 state["play_result"] = f"Playback aborted: {e}"
             finally:
                 lst.stop()
+                mlst.stop()
 
         state["play_result"] = None
         threading.Thread(target=worker, daemon=True).start()
@@ -1671,6 +1733,7 @@ QSpinBox::up-arrow, QTimeEdit::up-arrow {{ image: url("{chev_up}"); width: 10px;
         hud, flags, pre = state.get("hud"), state.get("play_flags"), state.get("pre_roll")
         if hud and flags and pre:  # repainted on the Qt thread; playback runs off it
             hud.sync(flags["paused"]) if pre["running"] else hud.countdown(pre["left"])
+            hud.apply_hover()
         if state["play_result"] is None:
             return
         play_poll.stop()
@@ -2056,6 +2119,11 @@ QSpinBox::up-arrow, QTimeEdit::up-arrow {{ image: url("{chev_up}"); width: 10px;
                              activated=delete_selected)
     del_sc.setContext(QtCore.Qt.WidgetShortcut)  # only while the list has focus
 
+    for key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):  # Enter plays the selection
+        sc = QtGui.QShortcut(QtGui.QKeySequence(key), listw,
+                             activated=lambda: selected_name() and start_playback())
+        sc.setContext(QtCore.Qt.WidgetShortcut)
+
     # F9 while idle starts a recording (the Recorder's own listener handles F9-to-finish)
     f9_hit = {"v": False}
     idle_listener = keyboard.Listener(
@@ -2262,14 +2330,15 @@ def main():
             log_run(path.stem, problem)
             sys.exit(1)
         flags = {"cancel": False, "paused": False}
-        playback_listener(flags).start()
 
         # Same border and pill the GUI shows while replaying, so a scheduled run is
         # never a silent takeover of the mouse and its controls stay discoverable.
         # Playback runs off-thread; Qt owns the main thread so the overlays paint.
         qapp = QtWidgets.QApplication(sys.argv)
         apply_theme(qapp)
-        hud = PlaybackHud(qapp, on_cancel=lambda: flags.__setitem__("cancel", True))
+        hud = PlaybackHud(qapp)
+        playback_listener(flags).start()
+        playback_mouse_listener(hud, flags).start()  # click Pause/Cancel with the mouse
         wait = SIGNIN_WAIT if args.signin else args.wait
         hud.show(counting_down=wait > 0)
         pre = {"left": max(0, wait), "running": False}
@@ -2279,6 +2348,7 @@ def main():
                 hud.sync(flags["paused"])
             else:
                 hud.countdown(pre["left"])
+            hud.apply_hover()
 
         QtCore.QTimer(qapp, interval=200, timeout=tick).start()
 
