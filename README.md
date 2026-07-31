@@ -99,3 +99,18 @@ assets/               icon, banner, chevrons, bundled Ubuntu font
 packaging/            build.ps1, make_icon.py, Inno Setup script
 requirements*.txt     runtime / build deps
 ```
+
+## Technologies
+
+[![Python](https://img.shields.io/badge/Python_3-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
+[![PySide6](https://img.shields.io/badge/PySide6-41CD52?style=flat-square&logo=qt&logoColor=white)](https://doc.qt.io/qtforpython)
+[![pynput](https://img.shields.io/badge/pynput-5A5A5A?style=flat-square&logoColor=white)](https://pynput.readthedocs.io)
+[![PyAutoGUI](https://img.shields.io/badge/PyAutoGUI-306998?style=flat-square&logo=python&logoColor=white)](https://pyautogui.readthedocs.io)
+[![Win32 API](https://img.shields.io/badge/Win32_API-0078D4?style=flat-square&logo=windows&logoColor=white)](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)
+[![ctypes](https://img.shields.io/badge/ctypes-4B8BBE?style=flat-square&logo=python&logoColor=white)](https://docs.python.org/3/library/ctypes.html)
+[![JSON](https://img.shields.io/badge/JSON-000000?style=flat-square&logo=json&logoColor=white)](https://www.json.org)
+[![Task Scheduler](https://img.shields.io/badge/Task_Scheduler-0078D4?style=flat-square&logo=windows&logoColor=white)](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-start-page)
+[![PowerShell](https://img.shields.io/badge/PowerShell-5391FE?style=flat-square&logo=powershell&logoColor=white)](https://learn.microsoft.com/en-us/powershell)
+[![PyInstaller](https://img.shields.io/badge/PyInstaller-FFD43B?style=flat-square&logo=python&logoColor=0d0d0d)](https://pyinstaller.org)
+[![Pillow](https://img.shields.io/badge/Pillow-8A2BE2?style=flat-square&logo=python&logoColor=white)](https://pillow.readthedocs.io)
+[![Inno Setup](https://img.shields.io/badge/Inno_Setup-264653?style=flat-square&logo=windows&logoColor=white)](https://jrsoftware.org/isinfo.php)
